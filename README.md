@@ -438,24 +438,7 @@ give you its new defaults.** Your saved values survive the upgrade and keep winn
 file is regenerated from flash, not from the code. If you want the defaults a new version ships
 with, delete the file.
 
-Concretely, the file you get back is not a copy of the one you deleted. It is this:
-
-```ini
-[General]
-Mode=PS1
-FlippedScreen=OFF
-[PS1]
-Autoboot=ON
-GameID=ON
-EnableControllerCombo=ON
-RememberLastCard=0
-FastMode_Enable=1
-FastMode_AckDelay=0
-MaxCardIdx=10
-MaxChannels=3
-BootCardTimeout=-1
-LedBootCardTimeout=-1
-```
+Concretely, the file you get back is not a copy of the one you deleted.
 
 (plus a `[PS2]` section that has no effect while `Mode=PS1`). Current card and channel, game id
 and display settings all go back to their initial values too — this is a full reset, not just a
