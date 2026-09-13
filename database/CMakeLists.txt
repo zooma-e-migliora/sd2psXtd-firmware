@@ -1,3 +1,8 @@
+# Gli input dei database stanno in sd2psXtd/file-aggiuntivi-build/ e sono
+# versionati col progetto: la VM di compilazione non ha rete, e prima di
+# averli in cache ogni build offline produceva un database VUOTO in
+# silenzio. Vedi il commento in testa a db_obj_builder.cmake.
+
 # PS1
 set(GAMEDB_PS1_OBJ "${CMAKE_CURRENT_BINARY_DIR}/gamedbps1.o")
 
@@ -9,6 +14,7 @@ add_custom_target(gamedbobjs_ps1 ALL
                         -D SYSTEM=ps1
                         -D "INPUT_URLS=https://github.com/niemasd/GameDB-PSX/releases/latest/download/PSX.data.json"
                         -D "REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                        -D "CACHE_DIR=${CMAKE_SOURCE_DIR}/file-aggiuntivi-build"
                         -P ${CMAKE_CURRENT_SOURCE_DIR}/db_obj_builder.cmake
                     VERBATIM
                     BYPRODUCTS ${GAMEDB_PS1_OBJ})
@@ -30,6 +36,7 @@ add_custom_target(gamedbobjs_ps2 ALL
                         -D SYSTEM=ps2
                         -D "INPUT_URLS=https://github.com/israpps/HDL-Batch-installer/raw/main/Database/gamename.csv"
                         -D "REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                        -D "CACHE_DIR=${CMAKE_SOURCE_DIR}/file-aggiuntivi-build"
                         -P ${CMAKE_CURRENT_SOURCE_DIR}/db_obj_builder.cmake
                     VERBATIM
                     BYPRODUCTS ${GAMEDB_PS2_OBJ})
@@ -50,6 +57,7 @@ add_custom_target(gamedbobjs_coh ALL
                         -D SYSTEM=coh
                         -D "INPUT_URLS=https://raw.githubusercontent.com/israpps/AthenaEnv/refs/heads/aclauncher/bin/aclauncher/246.json;https://raw.githubusercontent.com/israpps/AthenaEnv/refs/heads/aclauncher/bin/aclauncher/256.json"
                         -D "REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                        -D "CACHE_DIR=${CMAKE_SOURCE_DIR}/file-aggiuntivi-build"
                         -P ${CMAKE_CURRENT_SOURCE_DIR}/db_obj_builder.cmake
                     VERBATIM
                     BYPRODUCTS ${GAMEDB_COH_OBJ})

@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD 17)
 option(SD2PSX_WITH_PSRAM "Build SD2PSX with PSRAM support" ON)
 option(SD2PSX_WITH_GUI   "Build SD2PSX with GUI support" ON)
 option(SD2PSX_WITH_LED   "Build SD2PSX with LED support" OFF)
+option(SD2PSX_WITH_MSC   "Expose the microSD to the host as a USB mass storage device" OFF)
 option(DEBUG_USB_UART "Activate UART over USB for debugging" OFF)
 
 # variants
@@ -145,6 +146,28 @@ if (SD2PSX_WITH_LED)
 
 endif()
 
+# USB composito CDC + MSC (passthrough microSD). Deve stare dopo i target
+# sd2psx_common e sd2psx_led, da cui dipende.
+if (SD2PSX_WITH_MSC)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/usb)
+    target_link_libraries(${TARGET_NAME} PRIVATE sd2psx_usb)
+
+    # WITH_MSC=1 e' definito PUBLIC su sd2psx_usb, ma serial_input.c sta in
+    # sd2psx_common, che sd2psx_usb NON linka in questa direzione: senza la
+    # riga qui sotto tutti i "#if WITH_MSC" di serial_input.c sono CODICE MORTO.
+    #
+    # Non e' teoria: e' il motivo per cui "start emulation" rispondeva sempre
+    # "Emulation already running" prendendo il ramo #else, e per cui non ha mai
+    # potuto avviare davvero l'emulazione - msc_mode_request_emulation() sta nel
+    # ramo compilato via. L'unica uscita dall'attesa era staccare il cavo.
+    #
+    # La dipendenza fra le due librerie statiche e' circolare (sd2psx_usb linka
+    # sd2psx_common per serial_input_process()); CMake la gestisce ripetendole
+    # sulla riga del linker.
+    target_compile_definitions(sd2psx_common PUBLIC "WITH_MSC=1")
+    target_link_libraries(sd2psx_common PRIVATE sd2psx_usb)
+endif()
+
 set_target_properties(sd2psx_common PROPERTIES PICO_TARGET_LINKER_SCRIPT ${CMAKE_SOURCE_DIR}/memmap_custom.ld)
 
 pico_add_extra_outputs(${TARGET_NAME})
@@ -158,8 +181,19 @@ if(DEBUG_USB_UART)
         message(FATAL_ERROR "Misconfigured Debug Startup Delay: ${DEBUG_STARTUP_DELAY}")
     endif()
     target_compile_definitions(sd2psx_common PUBLIC -DDEBUG_USB_UART -DMMCE_DEBUG -DPICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=${DEBUG_STARTUP_DELAY}*1000)
-    pico_enable_stdio_usb(${TARGET_NAME} 1)
+    if (NOT SD2PSX_WITH_MSC)
+        pico_enable_stdio_usb(${TARGET_NAME} 1)
+    endif()
 else()
     target_compile_definitions(sd2psx_common PUBLIC -DPICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=0)
-    pico_enable_stdio_usb(${TARGET_NAME} 1)
+    if (NOT SD2PSX_WITH_MSC)
+        pico_enable_stdio_usb(${TARGET_NAME} 1)
+    endif()
+endif()
+
+# pico_stdio_usb e sd2psx_usb non possono coesistere: entrambi definiscono i
+# tud_descriptor_*_cb, e quelli del SDK non sono weak.
+if (SD2PSX_WITH_MSC AND DEBUG_USB_UART)
+    message(FATAL_ERROR "SD2PSX_WITH_MSC e DEBUG_USB_UART sono mutuamente esclusivi: "
+                        "il debug su USB usa pico_stdio_usb, che espone solo CDC.")
 endif()

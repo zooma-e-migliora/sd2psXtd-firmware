@@ -32,6 +32,16 @@
 #define ERR_CIV         0x05
 #define ERR_MC_DATA     0x06
 #define ERR_MC_AUTH_UNK 0x07
+/* Sottocasi di ERR_SDCARD: la scheda non risponde (assente, o problema di
+   collegamento/velocita') contro la scheda che risponde ma non ha un
+   filesystem riconoscibile. Distinti per poterli segnalare diversamente. */
+#define ERR_SD_ABSENT   0x08
+#define ERR_SD_FORMAT   0x09
+
+/* Errore non fatale rilevato dopo l'avvio: l'esecuzione prosegue, ma resta
+   memorizzato fino al reset. Vedi error_latch_set(). */
+void error_latch_set(int err);
+int error_latch_get(void);
 
 extern const char *log_level_str[];
 

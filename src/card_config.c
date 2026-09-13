@@ -142,11 +142,9 @@ bool card_config_read_image(uint8_t buff[1032], const char* card_folder, const c
 
     snprintf(full_cardname, 16, "%s-%i", card_base, chan_idx);
 
+    /* Solo <nome>-<canale>.bin: il ripiego sul nome base senza canale e' stato
+       tolto, un file puo' avere un nome solo. */
     card_config_get_image_name(card_folder, full_cardname, image_path);
-
-    if (!sd_exists(image_path)) {
-        card_config_get_image_name(card_folder, card_base, image_path);
-    }
 
     fd = sd_open(image_path, O_RDONLY);
     if (fd >= 0) {
@@ -204,12 +202,22 @@ uint8_t card_config_get_ps2_cardsize(const char* card_folder, const char* card_b
 uint8_t card_config_get_max_channels(const char* card_folder, const char* card_base) {
     char config_path[MAX_CFG_PATH_LENGTH];
     int fd;
+
+    /* Default: quello globale di settings.ini in modalita' PS1, altrimenti lo
+       storico 8. Il CardX.ini della singola card, se c'e', lo sovrascrive. */
+    uint8_t max_channels = 8;
+    if (settings_get_mode(true) == MODE_PS1) {
+        const uint8_t global = settings_get_ps1_maxchannels();
+        if (global > 0)
+            max_channels = global;
+    }
+
     parse_card_config_t ctx = {
         .channel_number = NULL,
         .channel_name = NULL,
         .channel_name_max_len = 0,
         .card_size = 0,
-        .max_channels = 8
+        .max_channels = max_channels
     };
 
     card_config_get_ini_name(card_folder, card_base, config_path);

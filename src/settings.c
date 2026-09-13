@@ -1,6 +1,7 @@
 #include "settings.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "debug.h"
@@ -30,8 +31,11 @@ typedef struct {
     uint8_t ps2_cardsize;
     // TODO: how do we store last used channel for cards that use autodetecting w/ gameid?
     uint8_t ps2_variant; // Variant for keys
-    uint8_t ps1_maxcardidx;    //1-255
+    uint8_t ps1_maxcardidx;    //1-255, 0 = nessun limite (si scrive -1 nell'ini)
     uint8_t ps2_maxcardidx;    //1-255
+    uint8_t ps1_bootcard_timeout; // secondi sulla BootCard prima di tornare alla card predefinita, 0 = mai
+    uint8_t ps1_maxchannels;   // canali per card, default per tutte; il CardX.ini puo' sovrascriverlo. 255 = tutti (si scrive -1 nell'ini)
+    uint8_t ps1_led_bootcard_timeout; // secondi di verde fisso in boot mode; FOLLOW = quanto dura la boot mode
 } settings_t;
 
 typedef struct {
@@ -42,28 +46,75 @@ typedef struct {
     uint8_t ps2_variant; // Variant for keys
     uint8_t ps1_maxcardidx;
     uint8_t ps2_maxcardidx;
+    uint8_t ps1_bootcard_timeout;
+    uint8_t ps1_maxchannels;
+    uint8_t ps1_led_bootcard_timeout;
 } serialized_settings_t;
 
 #define SETTINGS_UPDATE_FIELD(field) settings_update_part(&settings.field, sizeof(settings.field))
 
-#define SETTINGS_VERSION_MAGIC              (0xAACD0007)
+/* Alzato per far entrare in vigore il nuovo default di Autoboot su schede che
+   hanno gia' le impostazioni in flash, e perche' il byte di
+   ps1_bootcard_timeout prima era padding e conterrebbe spazzatura: il bump
+   azzera le impostazioni una volta.
+   0xAACD000D: nuovo bit FAST_MODE (allora SUPERFAST_FIX), acceso di default.
+   Senza il bump, sulle impostazioni gia' salvate il bit resterebbe a 0 e il
+   default non entrerebbe mai in vigore.
+
+   0xAACD000E: rimossa una chiave PS1 e il suo bit (0b0100000). Governava un
+   ritardo prima dell'ACK, esposto come opzione: mascherava il difetto
+   dell'issue 59 e ne creava un altro, il pad che si blocca nel visualizzatore
+   di memory card. Il bump serve a due cose: liberare il bit da un valore che
+   ora non significa piu' niente, e far riscrivere settings.ini senza la
+   chiave, cosi' nessuno resta a credere di
+   avere un'opzione che non c'e'. Vedi docs/ISSUE-59.md.
+
+   Un cambio dei soli valori di default non richiede piu' un bump: da
+   settings_load_sd() la mancanza di settings.ini vale come ritorno di
+   fabbrica, quindi per farli entrare in vigore basta cancellare il file. */
+#define SETTINGS_VERSION_MAGIC              (0xAACD000E)
 #define SETTINGS_PS1_FLAGS_AUTOBOOT         (0b0000001)
 #define SETTINGS_PS1_FLAGS_GAME_ID          (0b0000010)
 #define SETTINGS_PS1_FLAGS_CTRL_COMBO       (0b0000100)
+#define SETTINGS_PS1_FLAGS_REMEMBER_CARD    (0b0001000)
+#define SETTINGS_PS1_FLAGS_FAST_MODE        (0b0010000)
+/* 0b0100000 e' libero: apparteneva a un flag PS1 rimosso alla 0xAACD000E. */
 #define SETTINGS_PS2_FLAGS_AUTOBOOT         (0b0000001)
 #define SETTINGS_PS2_FLAGS_GAME_ID          (0b0000010)
 #define SETTINGS_SYS_FLAGS_PS2_MODE         (0b0000001)
 #define SETTINGS_SYS_FLAGS_FLIPPED_DISPLAY  (0b0000010)
 
-_Static_assert(sizeof(settings_t) == 24, "unexpected padding in the settings structure");
+/* 25 byte di campi piu' 3 di allineamento finale (il primo campo e' un uint32).
+   Era 24 prima dei campi aggiunti per BootCardTimeout, MaxChannels e
+   LedBootCardTimeout. L'area wear-levelled ne offre 512, quindi c'e' margine.
+   Come dice la nota sopra, ogni cambio di layout va accompagnato da un aumento
+   di SETTINGS_VERSION_MAGIC. */
+_Static_assert(sizeof(settings_t) == 28, "unexpected padding in the settings structure");
 
 static settings_t settings;
 static serialized_settings_t serialized_settings;
 static int tempmode;
 static const char settings_path[] = "/.sd2psx/settings.ini";
 
+/* Alzato dal parser quando ha dovuto correggere un valore: fa riscrivere l'ini
+   con quello che vale davvero, che e' l'unico modo per cui uno si accorge di
+   aver scritto una sciocchezza. Senza display non c'e' altro canale. */
+static bool settings_ini_dirty;
+
 static void settings_update_part(void *settings_ptr, uint32_t sz);
 static void settings_serialize(void);
+static void settings_serialize_internal(bool force);
+
+/* Il valore letto e' da correggere se non e' identico a come lo riscriveremmo:
+   copre -1, 0, 300, "pippo", gli zeri iniziali e gli spazi. Prende un int e non
+   un uint8_t perche' deve poter ricevere il -1 di "nessun limite". */
+static void mark_if_not_canonical(const char *value, int canonical) {
+    char buf[8];
+
+    snprintf(buf, sizeof(buf), "%d", canonical);
+    if (strcmp(value, buf) != 0)
+        settings_ini_dirty = true;
+}
 
 static int parse_card_configuration(void *user, const char *section, const char *name, const char *value) {
     serialized_settings_t* _s = user;
@@ -79,12 +130,64 @@ static int parse_card_configuration(void *user, const char *section, const char 
     } else if (MATCH("PS1", "EnableControllerCombo")
         && DIFFERS(value, ((_s->ps1_flags & SETTINGS_PS1_FLAGS_CTRL_COMBO) > 0))) {
         _s->ps1_flags ^= SETTINGS_PS1_FLAGS_CTRL_COMBO;
+    } else if (MATCH("PS1", "RememberLastCard")) {
+        /* Scritta come 0/1, ma si accetta anche ON/OFF come le altre. */
+        const bool on = (strcmp(value, "1") == 0) || (strcmp(value, "ON") == 0);
+        if (on != ((_s->ps1_flags & SETTINGS_PS1_FLAGS_REMEMBER_CARD) > 0))
+            _s->ps1_flags ^= SETTINGS_PS1_FLAGS_REMEMBER_CARD;
+    } else if (MATCH("PS1", "FastMode_Enable")) {
+        /* Timing PIO pre-1.2.1 mentre e' montata la boot card: serve al
+           FreePSXBoot "superfast". Vedi ps1_mc_spi.pio. */
+        const bool on = (strcmp(value, "1") == 0) || (strcmp(value, "ON") == 0);
+        if (on != ((_s->ps1_flags & SETTINGS_PS1_FLAGS_FAST_MODE) > 0))
+            _s->ps1_flags ^= SETTINGS_PS1_FLAGS_FAST_MODE;
+    } else if (MATCH("PS1", "LedBootCardTimeout")) {
+        /* -1 = segue BootCardTimeout, 0 = niente verde fisso, N = N secondi.
+           Il tetto rispetto a BootCardTimeout lo mette il getter, cosi' vale
+           anche se le due chiavi vengono modificate una alla volta. */
+        int timeout = atoi(value);
+        if (timeout < 0)
+            _s->ps1_led_bootcard_timeout = SETTINGS_LED_BOOTCARD_FOLLOW;
+        else if (timeout >= SETTINGS_LED_BOOTCARD_FOLLOW)
+            _s->ps1_led_bootcard_timeout = SETTINGS_LED_BOOTCARD_FOLLOW - 1;
+        else
+            _s->ps1_led_bootcard_timeout = (uint8_t)timeout;
+    } else if (MATCH("PS1", "MaxChannels")) {
+        /* Canali per card, default per tutte. Il CardX.ini di una singola card
+           puo' comunque sovrascriverlo.
+           Da 1 a 254 e' quel numero di canali; -1, 0 e il testo non numerico
+           vogliono dire "tutti", che qui coincide con il massimo del campo,
+           quindi si riscrivono tutti come -1.
+           strtol e non atoi: il testo puo' essere qualunque cosa e va letto
+           come intero con segno, il byte e' solo dove finisce il risultato.
+           Su un numero fuori dai limiti di long strtol satura, e il ramo del
+           massimo lo cattura; atoi li' sarebbe comportamento indefinito. */
+        const long maxchan = strtol(value, NULL, 10);
+        _s->ps1_maxchannels = (maxchan > 0 && maxchan < 255) ? (uint8_t)maxchan : 255;
+        mark_if_not_canonical(value, (_s->ps1_maxchannels == 255) ? -1 : (int)maxchan);
     } else if (MATCH("PS1", "MaxCardIdx")) {
-         int maxcard = atoi(value);
-         if (maxcard > 255)
-             _s->ps1_maxcardidx = 255;
-         else if (maxcard > 0)
-             _s->ps1_maxcardidx = maxcard;
+        /* Da 1 a 255 e' il numero di memcard scorribili; -1, 0 e il testo non
+           numerico vogliono dire "nessun limite", che internamente e' 0 e
+           lascia salire card_idx fino a UINT16_MAX (ps1_cardman_next_idx).
+           Qui il massimo del campo, 255, resta un limite vero e si scrive come
+           numero: e' meno di "nessun limite". */
+        const long maxcard = strtol(value, NULL, 10);
+        if (maxcard > 255)
+            _s->ps1_maxcardidx = 255;
+        else if (maxcard > 0)
+            _s->ps1_maxcardidx = (uint8_t)maxcard;
+        else
+            _s->ps1_maxcardidx = 0;
+        mark_if_not_canonical(value, (_s->ps1_maxcardidx == 0) ? -1 : _s->ps1_maxcardidx);
+    } else if (MATCH("PS1", "BootCardTimeout")) {
+        /* -1 = non si esce mai da soli (default), 0 = subito, N = N secondi. */
+        int timeout = atoi(value);
+        if (timeout < 0)
+            _s->ps1_bootcard_timeout = SETTINGS_BOOTCARD_TIMEOUT_NEVER;
+        else if (timeout >= SETTINGS_BOOTCARD_TIMEOUT_NEVER)
+            _s->ps1_bootcard_timeout = SETTINGS_BOOTCARD_TIMEOUT_NEVER - 1;
+        else
+            _s->ps1_bootcard_timeout = (uint8_t)timeout;
     } else if (MATCH("PS2", "MaxCardIdx")) {
          int maxcard = atoi(value);
          if (maxcard > 255)
@@ -144,8 +247,15 @@ static void settings_deserialize(void) {
                                              .ps2_variant = settings.ps2_variant,
                                              .ps1_flags = settings.ps1_flags,
                                              .ps1_maxcardidx = settings.ps1_maxcardidx,
-                                             .ps2_maxcardidx = settings.ps2_maxcardidx};
+                                             .ps2_maxcardidx = settings.ps2_maxcardidx,
+                                             .ps1_bootcard_timeout = settings.ps1_bootcard_timeout,
+                                             .ps1_maxchannels = settings.ps1_maxchannels,
+                                             .ps1_led_bootcard_timeout = settings.ps1_led_bootcard_timeout};
         serialized_settings = newSettings;
+        /* Azzerato qui e non a fine giro: settings_load_sd() torna a ogni
+           cambio di modalita' in main(), e un file gia' corretto non deve
+           trascinarsi dietro il flag della lettura precedente. */
+        settings_ini_dirty = false;
         ini_parse_sd_file(fd, parse_card_configuration, &newSettings);
         sd_close(fd);
         if (memcmp(&newSettings, &serialized_settings, sizeof(serialized_settings))) {
@@ -158,6 +268,9 @@ static void settings_deserialize(void) {
             settings.ps1_flags       = newSettings.ps1_flags;
             settings.ps1_maxcardidx  = newSettings.ps1_maxcardidx;
             settings.ps2_maxcardidx  = newSettings.ps2_maxcardidx;
+            settings.ps1_bootcard_timeout = newSettings.ps1_bootcard_timeout;
+            settings.ps1_maxchannels = newSettings.ps1_maxchannels;
+            settings.ps1_led_bootcard_timeout = newSettings.ps1_led_bootcard_timeout;
 
             wear_leveling_write(0, &settings, sizeof(settings));
         }
@@ -165,14 +278,25 @@ static void settings_deserialize(void) {
 }
 
 static void settings_serialize(void) {
+    settings_serialize_internal(false);
+}
+
+/* force salta il controllo qui sotto: serve dopo una lettura in cui il parser
+   ha corretto qualcosa, perche' li' le impostazioni in memoria coincidono gia'
+   con quelle "serializzate" e il file non verrebbe mai riscritto. */
+static void settings_serialize_internal(bool force) {
     int fd;
     // Only serialize if required
-    if (serialized_settings.ps1_maxcardidx == settings.ps1_maxcardidx &&
+    if (!force &&
+        serialized_settings.ps1_maxcardidx == settings.ps1_maxcardidx &&
         serialized_settings.ps2_maxcardidx == settings.ps2_maxcardidx &&
         serialized_settings.ps2_cardsize == settings.ps2_cardsize &&
         serialized_settings.ps2_flags == settings.ps2_flags &&
         serialized_settings.sys_flags == settings.sys_flags &&
         serialized_settings.ps2_variant == settings.ps2_variant &&
+        serialized_settings.ps1_bootcard_timeout == settings.ps1_bootcard_timeout &&
+        serialized_settings.ps1_maxchannels == settings.ps1_maxchannels &&
+        serialized_settings.ps1_led_bootcard_timeout == settings.ps1_led_bootcard_timeout &&
         serialized_settings.ps1_flags == settings.ps1_flags) {
         return;
     }
@@ -199,7 +323,32 @@ static void settings_serialize(void) {
         sd_write(fd, line_buffer, written);
         written = snprintf(line_buffer, 256, "EnableControllerCombo=%s\n", ((settings.ps1_flags & SETTINGS_PS1_FLAGS_CTRL_COMBO) > 0) ? "ON" : "OFF");
         sd_write(fd, line_buffer, written);
-        written = snprintf(line_buffer, 256, "MaxCardIdx=%u\n", settings.ps1_maxcardidx);
+        written = snprintf(line_buffer, 256, "RememberLastCard=%u\n", ((settings.ps1_flags & SETTINGS_PS1_FLAGS_REMEMBER_CARD) > 0) ? 1u : 0u);
+        sd_write(fd, line_buffer, written);
+        written = snprintf(line_buffer, 256, "FastMode_Enable=%u\n", ((settings.ps1_flags & SETTINGS_PS1_FLAGS_FAST_MODE) > 0) ? 1u : 0u);
+        sd_write(fd, line_buffer, written);
+        /* -1 e' la forma unica per "nessun limite", come per i due timeout qui
+           sotto: cosi' l'ini, il LEGGIMI e la guida dicono tutti la stessa
+           cosa. Per le memcard il valore interno e' 0, per i canali e' 255. */
+        if (settings.ps1_maxcardidx == 0)
+            written = snprintf(line_buffer, 256, "MaxCardIdx=-1\n");
+        else
+            written = snprintf(line_buffer, 256, "MaxCardIdx=%u\n", settings.ps1_maxcardidx);
+        sd_write(fd, line_buffer, written);
+        if (settings.ps1_maxchannels == 255)
+            written = snprintf(line_buffer, 256, "MaxChannels=-1\n");
+        else
+            written = snprintf(line_buffer, 256, "MaxChannels=%u\n", settings.ps1_maxchannels);
+        sd_write(fd, line_buffer, written);
+        if (settings.ps1_bootcard_timeout == SETTINGS_BOOTCARD_TIMEOUT_NEVER)
+            written = snprintf(line_buffer, 256, "BootCardTimeout=-1\n");
+        else
+            written = snprintf(line_buffer, 256, "BootCardTimeout=%u\n", settings.ps1_bootcard_timeout);
+        sd_write(fd, line_buffer, written);
+        if (settings.ps1_led_bootcard_timeout == SETTINGS_LED_BOOTCARD_FOLLOW)
+            written = snprintf(line_buffer, 256, "LedBootCardTimeout=-1\n");
+        else
+            written = snprintf(line_buffer, 256, "LedBootCardTimeout=%u\n", settings.ps1_led_bootcard_timeout);
         sd_write(fd, line_buffer, written);
         written = snprintf(line_buffer, 256, "[PS2]\n");
         sd_write(fd, line_buffer, written);
@@ -238,6 +387,9 @@ static void settings_serialize(void) {
     serialized_settings.ps1_flags       = settings.ps1_flags;
     serialized_settings.ps1_maxcardidx  = settings.ps1_maxcardidx;
     serialized_settings.ps2_maxcardidx  = settings.ps2_maxcardidx;
+    serialized_settings.ps1_bootcard_timeout = settings.ps1_bootcard_timeout;
+    serialized_settings.ps1_maxchannels = settings.ps1_maxchannels;
+    serialized_settings.ps1_led_bootcard_timeout = settings.ps1_led_bootcard_timeout;
 }
 
 static void settings_reset(void) {
@@ -246,12 +398,22 @@ static void settings_reset(void) {
     settings.display_timeout = 0; // off
     settings.display_contrast = 255; // 100%
     settings.display_vcomh = 0x30; // 0.83 x VCC
-    settings.ps1_flags = SETTINGS_PS1_FLAGS_GAME_ID | SETTINGS_PS1_FLAGS_CTRL_COMBO;
+    /* Autoboot acceso di default: se la BootCard non c'e' sulla microSD,
+       ps1_cardman ripiega da solo sulla card normale (try_set_boot_card). */
+    /* FAST_MODE acceso di default: agisce solo mentre e' montata la boot card,
+       quindi su una microSD senza payload non cambia nulla. */
+    settings.ps1_flags = SETTINGS_PS1_FLAGS_AUTOBOOT
+                       | SETTINGS_PS1_FLAGS_GAME_ID
+                       | SETTINGS_PS1_FLAGS_CTRL_COMBO
+                       | SETTINGS_PS1_FLAGS_FAST_MODE;
     settings.ps2_flags = SETTINGS_PS2_FLAGS_GAME_ID;
     settings.ps2_cardsize = 8;
     settings.ps2_variant = PS2_VARIANT_RETAIL;
-    settings.ps1_maxcardidx = 0; //unlimited UINT16_MAX
-    settings.ps2_maxcardidx = 0;
+    settings.ps1_maxcardidx = 10;
+    settings.ps2_maxcardidx = 0; //unlimited UINT16_MAX
+    settings.ps1_bootcard_timeout = SETTINGS_BOOTCARD_TIMEOUT_NEVER; // nessuna uscita a tempo
+    settings.ps1_maxchannels = 3;
+    settings.ps1_led_bootcard_timeout = SETTINGS_LED_BOOTCARD_FOLLOW; // verde per tutta la boot mode
     if (wear_leveling_write(0, &settings, sizeof(settings)) == WEAR_LEVELING_FAILED)
         fatal(ERR_SETTINGS, "failed to reset settings");
 }
@@ -259,8 +421,21 @@ static void settings_reset(void) {
 void settings_load_sd(void) {
     if (sd_exists(settings_path)) {
         settings_deserialize();
+        if (settings_ini_dirty) {
+            settings_ini_dirty = false;
+            settings_serialize_internal(true);
+        }
     } else {
-        settings_serialize();
+        /* File mancante = ritorno ai valori di fabbrica. Senza il reset qui il
+           file verrebbe riscritto a partire da quello che c'e' in flash, e
+           cancellarlo non servirebbe a niente: e' quello che rendeva
+           irraggiungibili i nuovi default su una scheda gia' usata.
+           Cosi' cambiare un default non richiede piu' di alzare il magic di
+           versione, basta cancellare il file.
+           force perche' dopo il reset le impostazioni possono gia' coincidere
+           con quelle serializzate, e allora il file non verrebbe ricreato. */
+        settings_reset();
+        settings_serialize_internal(true);
     }
 }
 
@@ -421,6 +596,17 @@ void settings_set_ps1_boot_channel(int chan) {
     }
 }
 
+uint8_t settings_get_ps1_bootcard_timeout(void) {
+    return settings.ps1_bootcard_timeout;
+}
+
+void settings_set_ps1_bootcard_timeout(uint8_t seconds) {
+    if (seconds != settings.ps1_bootcard_timeout) {
+        settings.ps1_bootcard_timeout = seconds;
+        SETTINGS_UPDATE_FIELD(ps1_bootcard_timeout);
+    }
+}
+
 int settings_get_mode(bool current) {
     if (current && tempmode == MODE_TEMP_PS1)
         return MODE_PS1;
@@ -465,6 +651,63 @@ void settings_set_ps1_game_id(bool enabled) {
         settings.ps1_flags ^= SETTINGS_PS1_FLAGS_GAME_ID;
     SETTINGS_UPDATE_FIELD(ps1_flags);
 }
+
+uint8_t settings_get_ps1_led_bootcard_timeout(void) {
+    const uint8_t led = settings.ps1_led_bootcard_timeout;
+
+    if (led == SETTINGS_LED_BOOTCARD_FOLLOW)
+        return led;
+
+    /* Non ha senso tenere il verde acceso piu' a lungo di quanto duri la boot
+       mode: si finirebbe col segnalare una modalita' gia' finita. Il tetto e'
+       messo qui e non in scrittura, cosi' vale anche quando le due chiavi
+       dell'ini vengono modificate una alla volta.
+       Se la boot mode non scade mai non c'e' nessun tetto da applicare. */
+    const uint8_t card = settings.ps1_bootcard_timeout;
+    if (card != SETTINGS_BOOTCARD_TIMEOUT_NEVER && led > card)
+        return card;
+
+    return led;
+}
+
+void settings_set_ps1_led_bootcard_timeout(uint8_t seconds) {
+    if (seconds != settings.ps1_led_bootcard_timeout) {
+        settings.ps1_led_bootcard_timeout = seconds;
+        SETTINGS_UPDATE_FIELD(ps1_led_bootcard_timeout);
+    }
+}
+
+uint8_t settings_get_ps1_maxchannels(void) {
+    return settings.ps1_maxchannels;
+}
+
+void settings_set_ps1_maxchannels(uint8_t maxchannels) {
+    if (maxchannels != settings.ps1_maxchannels) {
+        settings.ps1_maxchannels = maxchannels;
+        SETTINGS_UPDATE_FIELD(ps1_maxchannels);
+    }
+}
+
+bool settings_get_ps1_remember_card(void) {
+    return (settings.ps1_flags & SETTINGS_PS1_FLAGS_REMEMBER_CARD);
+}
+
+void settings_set_ps1_remember_card(bool remember) {
+    if (remember != settings_get_ps1_remember_card())
+        settings.ps1_flags ^= SETTINGS_PS1_FLAGS_REMEMBER_CARD;
+    SETTINGS_UPDATE_FIELD(ps1_flags);
+}
+
+bool settings_get_ps1_fast_mode(void) {
+    return (settings.ps1_flags & SETTINGS_PS1_FLAGS_FAST_MODE);
+}
+
+void settings_set_ps1_fast_mode(bool fast_mode) {
+    if (fast_mode != settings_get_ps1_fast_mode())
+        settings.ps1_flags ^= SETTINGS_PS1_FLAGS_FAST_MODE;
+    SETTINGS_UPDATE_FIELD(ps1_flags);
+}
+
 
 bool settings_get_ps1_controllercombo(void) {
     return (settings.ps1_flags & SETTINGS_PS1_FLAGS_CTRL_COMBO);

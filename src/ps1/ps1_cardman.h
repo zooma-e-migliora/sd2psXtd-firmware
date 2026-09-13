@@ -12,6 +12,11 @@ typedef enum {
     PS1_CM_STATE_NORMAL
 } ps1_cardman_state_t;
 
+/* Crea sulla microSD l'albero minimo (MemoryCards/PS1/Card1 e BOOT) piu' il
+   promemoria dentro BOOT. Va chiamata subito dopo sd_init(), prima del bivio
+   fra passthrough USB ed emulazione. Non e' fatale se fallisce. */
+void ps1_cardman_ensure_base_layout(void);
+
 void ps1_cardman_init(void);
 int ps1_cardman_read_sector(int sector, void *buf128);
 int ps1_cardman_write_sector(int sector, void *buf512);

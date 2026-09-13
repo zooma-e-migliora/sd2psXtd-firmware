@@ -26,18 +26,39 @@ static SdFat sd;
 static File files[NUM_FILES + 1];
 static bool initialized = false;
 
+/* Un tentativo di mount, senza fatal(): serve sia a sd_init() sia al ciclo che
+   aspetta l'inserimento della microSD dopo un avvio senza scheda.
+   initialized viene messo solo se il mount e' riuscito davvero. */
+extern "C" bool sd_try_mount() {
+    if (initialized)
+        return true;
+
+    SD_PERIPH.setRX(SD_MISO);
+    SD_PERIPH.setTX(SD_MOSI);
+    SD_PERIPH.setSCK(SD_SCK);
+    SD_PERIPH.setCS(SD_CS);
+    gpio_set_drive_strength(SD_SCK, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_drive_strength(SD_MOSI, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_drive_strength(SD_CS, GPIO_DRIVE_STRENGTH_12MA);
+
+    if (sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_BAUD, &SD_PERIPH)) != 1)
+        return false;
+
+    initialized = true;
+    return true;
+}
+
+/* Rimonta da zero. Serve dopo il passthrough USB: l'host ha scritto settori
+   sotto il naso di SdFat, quindi FAT e directory in cache sono ferme a prima e
+   vanno rilette. In quel punto non ci sono file aperti, percio' e' pulito. */
+extern "C" bool sd_remount() {
+    initialized = false;
+    return sd_try_mount();
+}
+
 extern "C" void sd_init() {
     if (!initialized) {
-        SD_PERIPH.setRX(SD_MISO);
-        SD_PERIPH.setTX(SD_MOSI);
-        SD_PERIPH.setSCK(SD_SCK);
-        SD_PERIPH.setCS(SD_CS);
-        gpio_set_drive_strength(SD_SCK, GPIO_DRIVE_STRENGTH_12MA);
-        gpio_set_drive_strength(SD_MOSI, GPIO_DRIVE_STRENGTH_12MA);
-        gpio_set_drive_strength(SD_CS, GPIO_DRIVE_STRENGTH_12MA);
-
-
-        int ret = sd.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_BAUD, &SD_PERIPH));
+        int ret = sd_try_mount() ? 1 : 0;
 /*
         cid_t cid;
         if (sd.card()->readCID(&cid)) {
@@ -66,15 +87,19 @@ extern "C" void sd_init() {
                 cid.psn,
                 cid.mdt_month, 2000 + ((cid.mdt_year_high << 4) | cid.mdt_year_low));
 
+            /* Tre cause diverse, tre codici diversi: i LED le segnalano con
+               ritmi distinti, cosi' si capisce cosa guardare senza collegare
+               la seriale. */
             if (sd.sdErrorCode()) {
-                fatal(ERR_SDCARD, "failed to mount the card\nSdError: 0x%02X,0x%02X\ncheck the card\n%s", sd.sdErrorCode(), sd.sdErrorData(), text);
+                /* La scheda non risponde: assente, oppure contatti/velocita' SPI. */
+                fatal(ERR_SD_ABSENT, "failed to mount the card\nSdError: 0x%02X,0x%02X\ncheck the card\n%s", sd.sdErrorCode(), sd.sdErrorData(), text);
             } else if (!sd.fatType()) {
-                fatal(ERR_SDCARD, "failed to mount the card\ncheck the card is formatted correctly");
+                /* La scheda risponde ma non c'e' un filesystem riconoscibile. */
+                fatal(ERR_SD_FORMAT, "failed to mount the card\ncheck the card is formatted correctly");
             } else {
                 fatal(ERR_SDCARD, "failed to mount the card\nUNKNOWN\n%s", text);
             }
         }
-        initialized = true;
     }
 }
 
@@ -328,4 +353,34 @@ extern "C" sd_cid_t sd_get_CID(void) {
         memset(&out_cid, 0, sizeof(sd_cid_t));
     }
     return out_cid;
+}
+
+/* --- accesso a settori grezzi (passthrough USB MSC) ---------------------- */
+
+extern "C" uint32_t sd_sector_count(void) {
+    if (!initialized)
+        return 0;
+    return sd.card()->sectorCount();
+}
+
+extern "C" uint16_t sd_sector_size(void) {
+    return 512;
+}
+
+extern "C" bool sd_read_sectors(uint32_t lba, uint8_t *dst, size_t count) {
+    if (!initialized)
+        return false;
+    return sd.card()->readSectors(lba, dst, count);
+}
+
+extern "C" bool sd_write_sectors(uint32_t lba, const uint8_t *src, size_t count) {
+    if (!initialized)
+        return false;
+    return sd.card()->writeSectors(lba, src, count);
+}
+
+extern "C" bool sd_sync_device(void) {
+    if (!initialized)
+        return false;
+    return sd.card()->syncDevice();
 }

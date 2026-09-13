@@ -10,8 +10,14 @@
 #if WITH_GUI
 #include "gui.h"
 #endif
+#if WITH_MSC
+#include "usb/msc_mode.h"
+#endif
 #include "ps1/ps1_mmce.h"
 #include "ps2/mmceman/ps2_mmceman.h"
+
+#include "ps1/ps1_memory_card.h"
+#include "ps1/ps1_cardman.h"
 
 #include "debug.h"
 #include "serial_input.h"
@@ -36,11 +42,25 @@ typedef enum {
     SERIAL_INPUT_CMD_PS2_VARIANT_COH,
     SERIAL_INPUT_CMD_CHANNEL_UP,
     SERIAL_INPUT_CMD_CHANNEL_DOWN,
+    SERIAL_INPUT_CMD_CARD_BOOT,
     SERIAL_INPUT_CMD_CARD_UP,
     SERIAL_INPUT_CMD_CARD_DOWN,
     SERIAL_INPUT_CMD_CARD_IDX,
     SERIAL_INPUT_CMD_CHANNEL_IDX,
     SERIAL_INPUT_CMD_GAMEID,
+    SERIAL_INPUT_CMD_START_EMULATION,
+    SERIAL_INPUT_CMD_STATUS,
+#if PS1_MC_TUNING
+    SERIAL_INPUT_CMD_TUNE,
+    SERIAL_INPUT_CMD_TUNE_SHOW,
+    SERIAL_INPUT_CMD_MCWRITES,
+    SERIAL_INPUT_CMD_MCGET,
+    SERIAL_INPUT_CMD_MCRING,
+    SERIAL_INPUT_CMD_MCCLEAR,
+#endif
+#if PS1_MMCE_TRACE
+    SERIAL_INPUT_CMD_MMCELOG,
+#endif
     SERIAL_INPUT_CMD_HELP
 } serial_input_cmd_t;
 
@@ -62,12 +82,40 @@ static const char help_text[] =
     "  channel up                          - Channel up\n"
     "  channel down                        - Channel down\n"
     "  set channel <idx>                   - Set channel index\n"
+    "  card boot                           - Mount the boot card (PS1)\n"
     "  card up                             - Card up\n"
     "  card down                           - Card down\n"
     "  set card <idx> [channel <idx>]      - Set card with optional channel\n"
     "  set game <id> [channel <idx>]       - Set game with optional channel\n"
     "  set mode <mode>                     - Set mode: ps1, ps2\n"
-    "  set variant <variant>               - Set PS2 variant: retail, proto, conquest, arcade\n";
+    "  set variant <variant>               - Set PS2 variant: retail, proto, conquest, arcade\n"
+    "  start emulation                     - Start card emulation (after eject)\n"
+    "  status                              - Mode (PS1/PS2), running mode and USB state\n"
+#if PS1_MC_TUNING
+    "PS1 boot profile tuning (PS1_MC_TUNING build):\n"
+    "  mcstat                              - print the EFFECTIVE state; read it before every test\n"
+    "  mcwrites                            - console writes to the boot card + read-backs; prints and clears\n"
+    "  mcget                               - full state as key=value lines, for mctest.py\n"
+    "  mcring                              - event ring: when each byte arrived\n"
+    "  mcclear                             - reset histograms, counters and the event ring\n"
+    "  set txdepth 0..8                    - TX FIFO fill cap on long reads; 0 = upstream lock-step\n"
+    "  set ackwidth <cycles>               - ACK pulse width 2..264; 0 = computed for the 2us minimum\n"
+    "  set ackhead <cycles>                - delay before requesting the ACK 0..31; 255 = per profile\n"
+    "  set tracestop 0|1                   - freeze the event ring on the first long silence\n"
+    "  set ackdelay <us>                   - delay before the ACK (only when the PIO waits for us)\n"
+    "  set ackwait 0|1                     - wait for the 8th rising edge before the next pull (default 1)\n"
+    "  set ackwidth <cycles>               - force the ACK width; 0 = computed from the divider (default)\n"
+    "  set datpio|rxpio|ctrlpio <div>      - PIO dividers, 0 = profile default\n"
+    "  set profile 0|1|2                   - 0 auto, 1 force standard, 2 force boot (whole profile)\n"
+    "  set mmcenodelay 0|1                 - MMCE commands skip the ACK delay (default 1)\n"
+    "  set delayall 0|1                    - apply the delay on any profile, not just boot (default 0)\n"
+    "  set boottimeout <s>                 - BootCard inactivity timeout, 255 = use settings.ini\n"
+#endif
+#if PS1_MMCE_TRACE
+    "MMCE command trace (PS1_MMCE_TRACE build):\n"
+    "  mmcelog                             - MMCE commands the console sent; prints and clears\n"
+#endif
+    ;
 
 static char in_buffer[SERIAL_INPUT_BUFFER_SIZE];
 static size_t in_len;
@@ -204,10 +252,56 @@ static void parse_command(char* input, serial_input_cmd_data_t* cmd_data) {
         cmd_data->cmd = SERIAL_INPUT_CMD_RESET_TO_BOOTLOADER;
     } else if ((argc == 2) && (strcmp(argv[0], "reset") == 0) && (strcmp(argv[1], "dev") == 0)) {
         cmd_data->cmd = SERIAL_INPUT_CMD_RESET;
+    } else if ((argc == 2) && (strcmp(argv[0], "start") == 0) && (strcmp(argv[1], "emulation") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_START_EMULATION;
+    } else if ((argc == 1) && (strcmp(argv[0], "status") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_STATUS;
+#if PS1_MC_TUNING
+    } else if ((argc == 1) && (strcmp(argv[0], "mcstat") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_TUNE_SHOW;
+    } else if ((argc == 1) && (strcmp(argv[0], "mcwrites") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_MCWRITES;
+    } else if ((argc == 1) && (strcmp(argv[0], "mcring") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_MCRING;
+    } else if ((argc == 1) && (strcmp(argv[0], "mcget") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_MCGET;
+    } else if ((argc == 1) && (strcmp(argv[0], "mcclear") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_MCCLEAR;
+#endif
+#if PS1_MMCE_TRACE
+    } else if ((argc == 1) && (strcmp(argv[0], "mmcelog") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_MMCELOG;
+#endif
+#if PS1_MC_TUNING
+    } else if ((argc == 3) && (strcmp(argv[0], "set") == 0)
+               && ((strcmp(argv[1], "ackdelay") == 0)
+                   || (strcmp(argv[1], "ackwidth") == 0)
+                   || (strcmp(argv[1], "datpio") == 0)
+                   || (strcmp(argv[1], "rxpio") == 0)
+                   || (strcmp(argv[1], "ctrlpio") == 0)
+                   || (strcmp(argv[1], "profile") == 0)
+                   || (strcmp(argv[1], "mmcenodelay") == 0)
+                   || (strcmp(argv[1], "longnodelay") == 0)
+                   || (strcmp(argv[1], "ackwait") == 0)
+                   || (strcmp(argv[1], "txdepth") == 0)
+                   || (strcmp(argv[1], "ackhead") == 0)
+                   || (strcmp(argv[1], "tracestop") == 0)
+                   || (strcmp(argv[1], "delayall") == 0)
+                   || (strcmp(argv[1], "boottimeout") == 0))) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_TUNE;
+        cmd_data->gameid[0] = 0;
+        strncpy(cmd_data->gameid, argv[1], sizeof(cmd_data->gameid) - 1);
+        if (!parse_int_arg(argv[2], &cmd_data->idx)) {
+            cmd_data->cmd = SERIAL_INPUT_CMD_INVALID;
+            cmd_data->error = "Usage: set <knob> <value>";
+        }
+#endif
     } else if ((argc == 2) && (strcmp(argv[0], "channel") == 0) && (strcmp(argv[1], "up") == 0)) {
         cmd_data->cmd = SERIAL_INPUT_CMD_CHANNEL_UP;
     } else if ((argc == 2) && (strcmp(argv[0], "channel") == 0) && (strcmp(argv[1], "down") == 0)) {
         cmd_data->cmd = SERIAL_INPUT_CMD_CHANNEL_DOWN;
+    } else if ((argc == 2) && (strcmp(argv[0], "card") == 0) && (strcmp(argv[1], "boot") == 0)) {
+        cmd_data->cmd = SERIAL_INPUT_CMD_CARD_BOOT;
     } else if ((argc == 2) && (strcmp(argv[0], "card") == 0) && (strcmp(argv[1], "up") == 0)) {
         cmd_data->cmd = SERIAL_INPUT_CMD_CARD_UP;
     } else if ((argc == 2) && (strcmp(argv[0], "card") == 0) && (strcmp(argv[1], "down") == 0)) {
@@ -264,7 +358,81 @@ static void parse_command(char* input, serial_input_cmd_data_t* cmd_data) {
     }
 }
 
+#if WITH_MSC
+/* Comandi ammessi mentre il volume e' montato sul PC: solo quelli che NON
+   toccano la microSD, che in passthrough e' dell'host. Eseguire gli altri
+   vorrebbe dire leggerla o riscriverla sotto il naso di Windows.
+ *
+ * Il cancello nasce insieme alla seriale viva in passthrough: prima il loop MSC
+ * non chiamava serial_input_process(), quindi il problema non si poneva ma la
+ * scheda sembrava piantata. Renderla viva senza questo avrebbe reso eseguibili
+ * proprio i comandi pericolosi. */
+static bool cmd_safe_in_passthrough(serial_input_cmd_t cmd) {
+    switch (cmd) {
+        case SERIAL_INPUT_CMD_NONE:
+        case SERIAL_INPUT_CMD_INVALID:
+        case SERIAL_INPUT_CMD_HELP:
+        case SERIAL_INPUT_CMD_STATUS:
+        case SERIAL_INPUT_CMD_RESET:
+        case SERIAL_INPUT_CMD_RESET_TO_BOOTLOADER:
+        /* Passa il cancello per poter dare il suo messaggio, che dice cosa fare
+           invece del rifiuto generico. */
+        case SERIAL_INPUT_CMD_START_EMULATION:
+#if PS1_MC_TUNING
+        case SERIAL_INPUT_CMD_TUNE:
+        case SERIAL_INPUT_CMD_TUNE_SHOW:
+        case SERIAL_INPUT_CMD_MCWRITES:
+        case SERIAL_INPUT_CMD_MCGET:
+        case SERIAL_INPUT_CMD_MCRING:
+        case SERIAL_INPUT_CMD_MCCLEAR:
+#endif
+#if PS1_MMCE_TRACE
+        case SERIAL_INPUT_CMD_MMCELOG:
+#endif
+            return true;
+        default:
+            return false;
+    }
+}
+#endif
+
+/* Le tre righe che mancavano, ed e' la loro assenza che ha fatto perdere un
+   giro: senza, dalla seriale non si distingue "modalita' PC" da "emulazione
+   attiva", e i numeri del PIO risultano tutti zero senza spiegazione. */
+static void print_status(void) {
+    const int configured = settings_get_mode(true);
+    const int running = main_get_running_mode();
+
+    printf("mode: %s (in esecuzione: %s)%s\n",
+           (configured == MODE_PS2) ? "PS2" : "PS1",
+           (running == MODE_PS2) ? "PS2" : "PS1",
+           (configured == MODE_PS2) ? "  <-- in una PS1 DANNEGGIA LA SCHEDA" : "");
+    if (configured != running)
+        printf("      cambio di modalita' IN ATTESA che la card sia idle\n");
+#if WITH_MSC
+    printf("usb:  %s\n", msc_mode_state_str());
+#else
+    printf("usb:  emulazione attiva\n");
+#endif
+    /* Card e canale: senza, una prova puo' misurare l'immagine sbagliata senza
+       che nessuno se ne accorga. In BOOT il canale sceglie quale payload. */
+    {
+        static const char *st[] = { "NAMED", "BOOT", "GAMEID", "NORMAL" };
+        const unsigned k = (unsigned)ps1_cardman_get_state();
+        printf("card: %s  indice %d  canale %d\n",
+               (k < 4u) ? st[k] : "?", ps1_cardman_get_idx(),
+               ps1_cardman_get_channel());
+    }
+}
+
 static void execute_command(const serial_input_cmd_data_t* cmd_data) {
+#if WITH_MSC
+    if ((msc_mode_state() == MSC_STATE_PASSTHROUGH)
+        && !cmd_safe_in_passthrough(cmd_data->cmd)) {
+        printf("volume montato, smonta il volume per continuare\n");
+        return;
+    }
+#endif
     switch (cmd_data->cmd) {
         case SERIAL_INPUT_CMD_NONE:
             break;
@@ -301,6 +469,19 @@ static void execute_command(const serial_input_cmd_data_t* cmd_data) {
                 ps2_mmceman_set_channel((uint16_t)cmd_data->idx, false);
             } else {
                 ps1_mmce_set_channel((uint16_t)cmd_data->idx, false);
+            }
+            break;
+        /* La boot card si poteva montare solo dall'accensione della scheda o
+           da un comando MMCE, cioe' da UniROM. Durante una campagna di misura
+           questo significa un giro di cavi per ogni prova sull'exploit:
+           scollegare l'USB, resettare la console, aspettare il LED verde,
+           ricollegare. Da qui si fa in un comando. */
+        case SERIAL_INPUT_CMD_CARD_BOOT:
+            if (settings_get_mode(true) == MODE_PS1) {
+                ps1_cardman_switch_bootcard();
+                printf("Boot card montata\n");
+            } else {
+                printf("Solo in modalita' PS1\n");
             }
             break;
         case SERIAL_INPUT_CMD_CARD_UP:
@@ -394,6 +575,62 @@ static void execute_command(const serial_input_cmd_data_t* cmd_data) {
             #if WITH_GUI
             gui_request_refresh();
             #endif
+            break;
+#if PS1_MC_TUNING
+        case SERIAL_INPUT_CMD_TUNE:
+            ps1_mc_tune_set(cmd_data->gameid, (uint32_t)cmd_data->idx);
+            /* Si rilegge SEMPRE tutto, non solo il valore appena scritto:
+               e' il controllo che mancava e che e' costato tre prove
+               annotate con parametri diversi da quelli reali. */
+            ps1_mc_tune_print();
+            break;
+
+        case SERIAL_INPUT_CMD_TUNE_SHOW:
+            ps1_mc_tune_print();
+            break;
+        case SERIAL_INPUT_CMD_MCWRITES:
+            ps1_mc_writes_print();
+            break;
+        case SERIAL_INPUT_CMD_MCGET:
+            ps1_mc_get_print();
+            break;
+        case SERIAL_INPUT_CMD_MCRING:
+            ps1_mc_ring_print();
+            break;
+        case SERIAL_INPUT_CMD_MCCLEAR:
+            ps1_mc_counters_clear();
+            break;
+#endif
+#if PS1_MMCE_TRACE
+        case SERIAL_INPUT_CMD_MMCELOG:
+            ps1_mc_mmcelog_print();
+            break;
+#endif
+
+        case SERIAL_INPUT_CMD_START_EMULATION:
+#if WITH_MSC
+            /* Tre stati, tre risposte. Prima se ne distinguevano due - "in
+               attesa" e "tutto il resto" - e "tutto il resto" comprendeva anche
+               il passthrough, dove l'emulazione NON gira: il comando rispondeva
+               "already running" proprio quando non era vero. */
+            switch (msc_mode_state()) {
+                case MSC_STATE_PASSTHROUGH:
+                    printf("volume montato, smonta il volume per continuare\n");
+                    break;
+                case MSC_STATE_HELD:
+                    printf("Starting emulation\n");
+                    msc_mode_request_emulation();
+                    break;
+                default:
+                    printf("Emulation already running\n");
+                    break;
+            }
+#else
+            printf("Emulation already running\n");
+#endif
+            break;
+        case SERIAL_INPUT_CMD_STATUS:
+            print_status();
             break;
         case SERIAL_INPUT_CMD_HELP:
             printf("%s", help_text);

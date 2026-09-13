@@ -112,10 +112,18 @@ void ps1_dirty_task(void) {
 
         QPRINTF("ps1 - write sector %d\n", sector);
 
+        /* Le scritture sulla boot card non arrivano fin qui: le scarta
+           ps1_mc_bootcard_sd_write_denied() in write_mc(), quindi la pagina in
+           coda non ci entra proprio. */
+
         if (ps1_cardman_write_sector(sector, flushbuf) != 0) {
             // TODO: do something if we get too many errors?
             // for now lets push it back into the heap and try again later
             QPRINTF("!! writing sector 0x%x failed\n", sector);
+
+            /* Non e' fatale (si riprova), ma l'utente deve poterlo sapere:
+               resta memorizzato fino al reset e accende il LED d'errore. */
+            error_latch_set(ERR_CARDMAN);
 
             ps1_dirty_lock();
             ps1_dirty_mark(sector);

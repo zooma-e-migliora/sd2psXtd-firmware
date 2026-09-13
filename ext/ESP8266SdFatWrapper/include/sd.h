@@ -64,6 +64,14 @@ typedef struct sd_cid_t {
 } sd_cid_t;
 
 void sd_init(void);
+
+/* Un tentativo di mount che non chiama fatal(): true se la microSD e' montata.
+   Usato dal ciclo che aspetta l'inserimento dopo un avvio senza scheda. */
+bool sd_try_mount(void);
+
+/* Rimonta da zero, rileggendo FAT e directory. Serve all'uscita dal
+   passthrough USB, dove l'host ha scritto settori scavalcando la cache. */
+bool sd_remount(void);
 int sd_open(const char *path, int oflag);
 int sd_close(int fd);
 void sd_flush(int fd);
@@ -92,3 +100,12 @@ int sd_seek64(int fd, int64_t offset, int whence);
 uint64_t sd_tell64(int fd);
 
 sd_cid_t sd_get_CID(void);
+
+/* Accesso a settori grezzi, usato dal passthrough USB MSC.
+   Va usato solo quando l'emulazione carta e' ferma: scavalca la cache del
+   filesystem, che dopo una scrittura non e' piu' coerente. */
+uint32_t sd_sector_count(void);
+uint16_t sd_sector_size(void);
+bool sd_read_sectors(uint32_t lba, uint8_t *dst, size_t count);
+bool sd_write_sectors(uint32_t lba, const uint8_t *src, size_t count);
+bool sd_sync_device(void);

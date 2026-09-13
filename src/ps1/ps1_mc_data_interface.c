@@ -11,6 +11,7 @@
 #include "psram.h"
 #endif
 #include "ps1_cardman.h"
+#include "ps1_memory_card.h"
 #include "ps1_dirty.h"
 
 #include "debug.h"
@@ -18,10 +19,21 @@
 
 #define PAGE_CACHE_SIZE 40
 #define MAX_READ_AHEAD 0
-#define PS1_CARD_SIZE 128 * 1024
+#define PS1_CARD_SIZE (128 * 1024)
+#define PS1_CARD_PAGES (PS1_CARD_SIZE / PS1_PAGE_SIZE)
+
+/* Secondo strato del clamp del settore. Il primo, quello che conta per il
+   protocollo, sta in ps1_memory_card.c: maschera i due byte dell'indirizzo
+   appena arrivano, cosi' l'eco dell'indirizzo confermato e' quello giusto.
+   Questo qui non serve a rispondere bene, serve a garantire che NESSUN
+   chiamante - oggi o domani - possa indicizzare fuori da "card". Per un
+   indirizzo valido sono entrambi no-op. */
+#define PS1_WRAP_PAGE(p)    ((p) & (PS1_CARD_PAGES - 1u))
+#define PS1_WRAP_ADDRESS(a) ((a) & (PS1_CARD_SIZE - 1u))
 
 static volatile bool dma_in_progress = false;
 static volatile bool write_occured = false;
+static volatile bool read_occured = false;
 
 
 #define card cache
@@ -39,7 +51,7 @@ void __time_critical_func(ps1_mc_data_interface_start_dma)(uint32_t page) {
     /* the spinlock will be unlocked by the DMA irq once all data is tx'd */
     ps1_dirty_lock();
     dma_in_progress = true;
-    psram_read_dma(page * PS1_PAGE_SIZE, card, PS1_PAGE_SIZE, ps1_mc_data_interface_rx_done);
+    psram_read_dma(PS1_WRAP_PAGE(page) * PS1_PAGE_SIZE, card, PS1_PAGE_SIZE, ps1_mc_data_interface_rx_done);
 }
 #endif
 
@@ -54,32 +66,47 @@ void __time_critical_func(ps1_mc_data_interface_setup_read_page)(uint32_t page) 
 uint8_t* __time_critical_func(ps1_mc_data_interface_get_page)(uint32_t page) {
     uint8_t* ret = NULL;
 
+    read_occured = true;
+
 #ifdef WITH_PSRAM
     (void)page;
     ret = card;
 #else
-    ret = &card[page*PS1_PAGE_SIZE];
+    ret = &card[PS1_WRAP_PAGE(page)*PS1_PAGE_SIZE];
 #endif
 
     return ret;
 }
 
 void __time_critical_func(ps1_mc_data_interface_write_byte)(uint32_t address, uint8_t byte) {
+    /* Sulla boot card non si scrive nemmeno in RAM: e' da li' che la console
+       legge, ed e' l'unico modo perche' quello che legge sia sempre il file.
+       Livello PS1_BOOTCARD_RAM_READONLY, spiegato per esteso nell'header. */
+    if (ps1_mc_bootcard_ram_write_denied())
+        return;
+
 #if WITH_PSRAM
     card[address%PS1_PAGE_SIZE] = byte;
     ps1_dirty_lockout_renew();
     ps1_dirty_lock();
-    psram_write_dma(address, &card[address%PS1_PAGE_SIZE], 1, NULL);
+    psram_write_dma(PS1_WRAP_ADDRESS(address), &card[address%PS1_PAGE_SIZE], 1, NULL);
     psram_wait_for_dma();
 
     ps1_dirty_unlock();
 #else
-    card[address] = byte;
+    card[PS1_WRAP_ADDRESS(address)] = byte;
 #endif
     write_occured = true;
 }
 
 void __time_critical_func(ps1_mc_data_interface_write_mc)(uint32_t page) {
+    /* Sulla boot card le scritture non vengono mai riportate sulla microSD: il
+       file conterrebbe un'immagine dell'exploit progressivamente rovinata, e il
+       payload smetterebbe di funzionare senza che si capisca perche'.
+       Livello PS1_BOOTCARD_SD_READONLY, spiegato per esteso nell'header. */
+    if (ps1_mc_bootcard_sd_write_denied())
+        return;
+
     ps1_dirty_mark(page);
 }
 
@@ -106,8 +133,13 @@ bool ps1_mc_data_interface_write_occured(void) {
     return write_occured;
 }
 
+bool ps1_mc_data_interface_read_occured(void) {
+    return read_occured;
+}
+
 void ps1_mc_data_interface_task(void) {
     write_occured = false;
+    read_occured = false;
 
     ps1_dirty_task();
 }

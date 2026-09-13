@@ -20,5 +20,6 @@ void ps1_mc_data_interface_wait_for_byte(uint32_t offset);
 
 void ps1_mc_data_interface_card_changed(void);
 bool ps1_mc_data_interface_write_occured(void);
+bool ps1_mc_data_interface_read_occured(void);
 void ps1_mc_data_interface_task(void);
 void ps1_mc_data_interface_flush(void);

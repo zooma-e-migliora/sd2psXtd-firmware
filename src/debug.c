@@ -11,7 +11,10 @@
 #if WITH_GUI
 #include "oled.h"
 #endif
+#include "hardware/watchdog.h"
 #include "pico/platform.h"
+#include "pico/time.h"
+#include "sd.h"
 
 const char *log_level_str[] = {
     " ",
@@ -20,6 +23,9 @@ const char *log_level_str[] = {
     "[INFO] ",
     "[TRACE]"
 };
+
+/* Ogni quanto ritentare il mount della microSD quando manca all'avvio. */
+#define SD_RETRY_MS 1000
 
 static char debug_queue[1024];
 static size_t debug_read_pos, debug_write_pos;
@@ -70,18 +76,48 @@ void fatal(int err, const char *format, ...) {
         oled_show();
     }
 #endif
-    while (true) {
+    /* microSD assente e' l'unico errore che l'utente puo' risolvere senza
+       togliere corrente: invece di restare bloccati per sempre si continua a
+       lampeggiare rosso e si ritenta il mount. Appena la scheda compare si
+       riparte da zero, che e' anche il modo piu' sicuro di montarla. */
+    if (err == ERR_SD_ABSENT) {
+        absolute_time_t next_try = make_timeout_time_ms(SD_RETRY_MS);
+
+        while (true) {
 #if WITH_LED
-        for (int i = 0; i < err; i++) {
-            led_fatal();
-            sleep_ms(250);
-            led_clear();
-            sleep_ms(250);
-        }
-        sleep_ms(1000);
+            led_error_tick(err);
 #endif
+            if (time_reached(next_try)) {
+                if (sd_try_mount()) {
+                    printf("microSD rilevata, riavvio\n");
+                    watchdog_reboot(0, 0, 0);
+                }
+                next_try = make_timeout_time_ms(SD_RETRY_MS);
+            }
+            busy_wait_us_32(2000);
+        }
     }
 
+#if WITH_LED
+    led_error_forever(err);
+#endif
+    while (true) {
+        tight_loop_contents();
+    }
+
+}
+
+/* Errori non fatali: l'esecuzione prosegue, ma il primo errore rilevato resta
+   memorizzato fino al reset perche' i LED possano segnalarlo. */
+static volatile int latched_error;
+
+void error_latch_set(int err) {
+    if (latched_error == 0)
+        latched_error = err;
+}
+
+int error_latch_get(void) {
+    return latched_error;
 }
 
 void hexdump(const uint8_t *buf, size_t sz) {

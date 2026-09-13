@@ -10,8 +10,10 @@ void ps1_mmce_prev_ch(bool delay);
 void ps1_mmce_next_idx(bool delay);
 void ps1_mmce_prev_idx(bool delay);
 void ps1_mmce_switch_bootcard(bool delay);
+void ps1_mmce_switch_default(bool delay);
 bool ps1_mmce_set_gameid(const uint8_t* const game_id);
 void ps1_mmce_reset(bool delay);
 
 void ps1_mmce_set_card(uint16_t cnum, bool delay);
 void ps1_mmce_set_channel(uint16_t chn, bool delay);
+

@@ -1,306 +1,559 @@
-![sd2psXtd Logo](doc/Logo.png)
-*Logo by Berion ❤️*
+# What's new — key differences from upstream sd2psXtd
 
-# sd2psXtd Firmware
+This firmware is a fork of [sd2psXtd](https://github.com/sd2psXtd/firmware) 1.4.0, focused on
+PS1 use. If you already know sd2psXtd, this page is the only one you need: it covers what
+behaves **differently**, not what stayed the same.
 
-sd2psXtd is an extended firmware for the popular *Multipurpose MemoryCard Emulator* sd2psx by developer @xyzz (see [here](https://github.com/sd2psx)). It combines cutting-edge extended functionality (like game ID switching, file system access, and dynamic mode selection) with the rock-solid performance of the original sd2psx firmware.
+Everything below is about PS1. PS2 support is still compiled in and untouched.
+This has been tested on a Bitfunx Psxmemcard PS1 Memory Card - for Sony PlayStation 1/PS One, RP2040 Based.
+Built firmware to download are in the `firmware-built` directory, check the pinout section to know what to download (for the above card use `psxmemcardmsc.uf2`)
 
-It provides the same functionality as the official stable firmware and extends it with the following features:
+---
 
-- **PS2:** Game ID switching
-- **PS2:** PS1 dynamic mode selection
-- **PS2:** MMCEMAN and MMCEDRV support
-- **PS2:** Instant card availability
-- **PS2:** 1-128 MB card size support
-- **PS2:** Support for developer (`DTL-H` & `DTL-T`), Arcade (`COH-H`) and Prototype (`EB`?) models is available.
-- **PS1:** BootCard mechanics
-- **PS1:** PSRAM support
-- **PS1:** Card Switch Controller Combo Support
-- **PS1:** Super fast FreePSXBoot
-- **PS1:** Net Yaroze Support
-- **General:** Settings file
-- **General:** Support for other RP2040-based MMCE devices
-- **General:** Per Card Config
-- **General:** Game2Folder mapping
-- **General:** Splash Screen
-- **General:** Game Image Screen
-- **General:** USB-CDC command interface
+## At a glance
 
-## PS2: Game ID Switching
+| | What changed | In one line |
+|---|---|---|
+| 1 | [microSD passthrough over USB](#1-microsd-passthrough-over-usb) | Plug the card into a PC and the microSD shows up as a USB drive — no card reader, no disassembly. **Steady white LED** while the drive is mounted. |
+| 2 | [New pad shortcut](#2-new-pad-shortcut-select--l1--l2) | `SELECT + L1 + L2` opens a **mode** the d-pad drives — reachable **with one hand** — and a **steady magenta LED** reminds you you're in it. |
+| 3 | [RGB LED colour scheme](#3-rgb-led-colour-scheme) | Seven states, seven colours, dark when idle. **Yellow blinks tell you which card and channel** you landed on. |
+| 4 | [BootCard is read-only and self-exiting](#4-bootcard-read-only-out-of-the-card-list-self-exiting) | A **special slot reserved for booting**: **steady green LED** whenever it's mounted, off the browse list, write-protected, and it leaves on its own once boot is done. |
+| 5 | [New serial commands](#5-new-serial-commands) | `status`, `card boot`, `start emulation` — and the serial port stays alive while the PC has the drive mounted. |
+| 6 | [Folder tree created automatically](#6-folder-tree-created-automatically) | A blank microSD comes back from first boot already laid out, with the settings file written — and **deleting `settings.ini` is now a real factory reset**, not a rewrite of the values you already had. |
 
-Like on PS1, *sd2psXtd* can detect the game ID of a PS2 console and switch to a dedicated card per game. Game ID switching can be turned off in the device settings for PS2.
+---
 
-This is done in two ways:
+## 1. microSD passthrough over USB
 
-### History File Tracking
+Plug the memory card into a PC with a USB cable and **the microSD appears as a normal USB drive**.
+No card reader, nothing to take apart — drag your saves on and off. The device is composite, so
+the PC also gets a serial port (`COMx`, `/dev/ttyACM0`) at the same time; VID `CAFE`, PID `4003`.
 
-When starting a game, the PS2 writes its game ID to a history file on the current memory card. *sd2psXtd* tracks the write to this file and detects which game ID has just been written. After that, a game card for this game is mounted and exposed to the PS2.
+Two things are worth knowing:
 
-### MMCEMAN Game ID
+**The LED is steady white the whole time the drive is mounted** (§3), so passthrough is never
+something you have to guess at. Host reads and writes blink cyan and blue on top of it.
 
-*MMCEMAN* is a custom IOP module to communicate with Multipurpose Memory Card Emulators. This can be integrated with OPL so OPL can directly send the game ID of a launched game to *sd2psx*.
+**Ejecting does not start card emulation.** At power-up the firmware looks for a USB host for
+3 seconds: if the cable is connected it goes into drive mode and emulation never starts. Getting
+out of that depends on how you do it:
 
-## PS2: PS1 Dynamic Mode Selection
+| | Emulation |
+|---|---|
+| **Unplug the cable** (which powers the board off) | starts by itself **3 seconds** after the console powers it back up — that is the window it spends looking for a USB host, and it is the normal, everyday case |
+| **Eject the volume, cable still attached** | **does not start** — the firmware waits for the `start emulation` command on the serial port (§5) |
 
-When launching in PS2 mode, commands sent to *sd2psx* are monitored. Since PS1 sends controller messages on the same bus as memory card messages, if a controller message is detected, the PS2 switches to PS1 mode.
+(If the board is sitting in a powered-on console *and* on USB at the same time, pulling the cable
+doesn't cut the power: there the firmware notices after about half a second and starts emulating
+without a restart.)
 
-While in general this should be safe behavior, if *sd2psx* is used mainly in PS1, manual mode selection is recommended.
+That is deliberate. An eject is usually just an eject, and running the card while still tethered
+to a PC **is useful only for debugging** — which is exactly what `start emulation` is for: it lets
+you run the card in the console with the cable attached and read the log live. Doing it
+automatically would be wrong; with `Autoboot` on it would even mount the boot card, which without
+a console has no way out. No cable, on the other hand, means there is no PC left to serve, so
+there emulation has to start by itself.
 
-> [!CAUTION]
-> **Note 1:** If *sd2psx* is connected to a PS1 in PS2 mode, there is always a risk of damaging your PS1 console. You have been warned!
+After an eject the LED goes off — no reboot, and **no red**, because ejecting is not an error.
+To get back into drive mode, unplug and replug the cable.
 
-> [!CAUTION]
-> **Note 2:** Do not use *sd2psx* in dynamic mode on a PS1 multitap, as this **WILL** damage your PS1 multitap device.
+> **Known limitation on SD2PSX hardware:** while the drive is mounted the OLED keeps showing its
+> last frame, because drawing the menu would mean reading the microSD, which at that moment
+> belongs to the PC.
 
-## PS2: MMCEMAN and MMCEDRV Support
+---
 
-*MMCEMAN* is a PS2 module for interacting with *Multipurpose Memory Card Emulators*. Its main use cases include:
+## 2. New pad shortcut: `SELECT + L1 + L2`
 
-- **Card Switching:** MMCEMMAN can request a card change on *MMCEs*, such as setting a channel or selecting a specific card.
-- **Game ID Communication:** MMCEMAN can send a game ID to the *MMCE*, which may in turn switch to a dedicated card for this ID if activated.
-- **File System Access:** MMCEMAN allows access to *MMCEs* filesystem through standard POSIX file I/O calls
-- **Game loading:** MMCEDRV allows for loading games off of *MMCEs* with performance equal to, or in most cases, better than MX4SIO.
+**The upstream combo requires two hands.** This one is a **mode**, and its three buttons were
+chosen so the whole thing can be done **with one hand**: SELECT, L1 and L2 all sit under the left
+hand, which then keeps one of them held while the thumb works the d-pad.
 
-## PS2: Instant Card Availability
+**To enter the combo mode:** press **SELECT + L1 + L2** together.
 
-If using 8MB cards, *sd2psXtd* firmware exposes the card to the PS2 while it is still being transferred to PSRAM. This enables using FMCB/PS2BBL at boot time without additional waiting scripts.
-Very helpful for PlayStation 2 models with simpler OSDSYS programs, that result on faster boot times (like PSX DESR and Arcade PS2)
+**To stay in the combo mode:** keep **at least one** of the three held. You can let go of SELECT and keep just
+the two triggers, or even just one. You leave the combo mode when you release **all three**.
 
-## PS2: 1-128 MB Card Size Support
+**While you're in the combo mode**, the d-pad drives the card:
 
-Support for card sizes between 1 and 128 MB has been added. Cards larger than 8 MB rely heavily on quick SD card access, so on older or lower-quality SD cards, these larger cards may become corrupt.
+| Button | Action |
+|---|---|
+| **Up** | next card — `Card1` → `Card2` → `Card3`, up to `MaxCardIdx` |
+| **Down** | previous card — `Card3` → `Card2` → `Card1`, and below that out of the numbered cards |
+| **Right** | next channel |
+| **Left** | previous channel |
+| **START** | switch to the **BootCard**, if one exists |
 
-> [!NOTE]
->  While the feature has been extensively tested, it is still recommended to use 8MB cards, as this is the official specification for memory cards.
+While you stay in the combo mode you can chain several changes — up, up, right — without re-pressing
+SELECT each time.
 
-## PS2: Support for Developer, Arcade and Prototype PS2s
+**The LED stays steady magenta the whole time you are in the combo mode**, and that is the other half
+of the design: a mode you hold with one hand needs something to remind you it is open. It is not
+a blink when you enter, it is a colour that *stays on*, so at any moment you can tell whether the
+d-pad is driving the memory card or the game. Card changes blink **yellow** on top of the magenta
+— those blinks tell you which card and channel you landed on (§3) — and then it returns to
+magenta; when you release all three buttons the magenta goes out.
 
-PS2 memory cards have been used in variations of PS2 like: *DevKits*, *TestKits*, *Arcades* and *Prototypes*.
+The shortcut needs `EnableControllerCombo=ON` in `settings.ini` (it is on by default). With it
+off, the pad does nothing at all.
 
-*sd2psXtd* firmware supports these devices by configuring the variant within the PS2 settings.
+**Up/Down walk one single list**, not just the numbered cards:
 
-These PlayStation 2 variations use different magicgate keysets to ensure their memory cards are inaccessible in other devices (e.g., opening a developer memory card on a normal PS2). This is why SD2PSX must actively support them.
-
-> [!NOTE]
-> **Devkit/DTL-H owners**:
-> as you may notice, SD2PSX has no `DEVELOPER` mode, this is because sd2psxtd is mimicking the behavior of licensed retail card. To use the device on developer hardware, set the card to `RETAIL` mode [^1]
-
-[^1]: Devkits: official retail memory cards use developer magicgate by default until the console actively requests to use retail magicgate with a dedicated command
-
-## PS1: BootCard Mechanics
-
-If BootCard functionality is activated, the PS1 starts with BootCards at startup. If BootCard is not activated, the card index and channel from the previous session are restored automatically.
-
-## PS1: PSRAM Support
-
-*sd2psXtd* firmware allows PS1 cards to be served from PSRAM. While this is mainly an under-the-hood change, it provides more flexibility in RAM usage.
-
-## PS1: Card Switch Controller Combo Support
-
-
-Controller Button Mapping for Card and Channel Switching
-
-The following button combinations are used to perform card and channel switches:
-
-- L1 + R1 + L2 + R2 + Up: Switch to the Next Card
-- L1 + R1 + L2 + R2 + Down: Switch to the Previous Card
-- L1 + R1 + L2 + R2 + Right: Switch to the Next Channel
-- L1 + R1 + L2 + R2 + Left: Switch to the Previous Channel
-- L1 + R1 + L2 + R2 + SELECT: Switch to Boot Card
-
-These mappings require that all four buttons (L1, R1, L2, R2) are held down in combination with one of the directional inputs.
-
-The Controller Combos can be activated by a setting in the PS1 Settings menu.
-
-## PS1: Super fast FreePSXBoot
-
-*sd2psXtd* allows super fast booting of FreePSXBoot by using some non standard card communication.
-Please note: This is only possible using a special FreePSXBoot Version provided at https://sd2psXtd.github.io
-
-## PS1: Net Yaroze Support
-
-*sd2psXtd* will act as a Net Yaroze Access Card, if used with the Net Yaroze Software.
-
-## General: USB-CDC Command Interface
-
-When the firmware is running, the device exposes a USB-CDC serial interface that accepts simple text commands. This can be used to change cards, channels, modes, PS2 variants, or to reboot the device without using the on-device controls.
-
-Commands are lowercase and submitted with Enter:
-
-```text
-help
-reset bl
-reset dev
-channel up
-channel down
-set channel <idx>
-card up
-card down
-set card <idx> [channel <idx>]
-set game <id> [channel <idx>]
-set mode <ps1|ps2>
-set variant <retail|proto|conquest|arcade>
+```
+named folders  →  Game ID card  →  Card1  →  Card2  →  Card3  →  …
+   ←—— DOWN                                                UP ——→
 ```
 
-`reset bl` resets to the bootloader. `reset dev` restarts the firmware. Card, channel, and game commands affect the currently active mode. Setting a PS2 variant also switches the device to PS2 mode.
+Any subfolder of `MemoryCards/PS1/` that isn't `BOOT` or `CardN`, with a name under 16
+characters, counts as a "named folder" — useful for themed cards (`Platform`, `RPG`, `Import`).
+The BootCard is deliberately **not** in this list (see §4).
 
+Left/Right stay **inside the current card** and change channel, from 1 to `MaxChannels`.
 
-## General: Settings File
+Which buttons do what is **not** configurable: they are fixed `#define`s and change only by
+recompiling.
 
-*sd2psXtd* generates a settings file (`.sd2psx/settings.ini`) that allows you to edit some settings through your computer. This is useful when using one SD card with multiple *sd2psx* devices or *MMCE* devices without a display to change settings.
+> Inside **UniROM**, the "Switch MCPro Channel / card" entry is a completely separate path: the
+> console reads the pad itself and sends MMCE commands over the memory-card bus. There you don't
+> hold SELECT, and `EnableControllerCombo` has nothing to do with it. Unchanged from upstream.
 
-A settings file has the following format:
+---
+
+## 3. RGB LED colour scheme
+
+For boards with an RGB LED. The whole scheme follows one rule, and it is the opposite of what
+the original PicoMemcard firmware did.
+
+**Before: an ugly red LED sitting on, permanently.** It was on when the card was idle, on when it
+was working, on when something was wrong. A light that is always on tells you nothing.
+
+**Now: everything off by default, and the LED lights up only when something actually happens.**
+Nothing in progress means no light at all. So any light you see is a real event, and it is worth
+looking at. That is the entire philosophy, and everything below follows from it: the colour tells
+you *what* is happening, the rhythm tells you *how much* or *which one*, and darkness means the
+card is simply doing its job.
+
+The corollary is that the three states you might need to recognise *without* having seen them
+start — pad mode, boot card, USB — get a colour that **stays on** rather than a blink, because a
+blink you missed is a blink that never happened. Everything else blinks, briefly, and goes away.
+
+There are seven states in all, one colour each.
+
+| Colour | Meaning | Pattern |
+|---|---|---|
+| **off** | idle, all well — including waiting for `start emulation` after an eject (§1) | — |
+| red → green → blue | **power-on**: the firmware started | sweep, ~0.4 s total |
+| **white** | **ready**: microSD mounted, entering emulation | one short flash |
+| **cyan** | **reading** from the memory card | slow blink (~2 Hz) |
+| **blue** | **writing** to the memory card | fast blink (~8 Hz) |
+| **magenta** | **pad mode active** (§2) | **steady** while you're in it |
+| **yellow** | **card or channel change** | N blinks, see below |
+| **green** | **boot card mounted** (§4) | **steady** while it's in use |
+| **white** | **USB MSC mode**, connected to a PC | **steady** |
+| **red** | **error** | the rhythm tells you which |
+
+The startup sweep doubles as a self-test: if one of the three colours is missing, that LED
+channel or its wiring has a problem. The sweep and the white "ready" flash are separated by the
+microSD init and the USB host wait, so **if you see the sweep but never the white flash**, the
+firmware started but stopped before being ready — look at the red.
+
+**Yellow — which card you landed on.** Useful because these boards have no display:
+
+| Selected card | Pattern |
+|---|---|
+| numbered `CardN` | **N short blinks** (Card3 → 3 blinks) |
+| Game ID card | **2 long blinks** |
+| named folder, position N | **3 long blinks + N short** |
+| **channel change** | **N short blinks** = channel number |
+| BootCard | **2 long green blinks**, then steady green |
+
+**Red — errors**, told apart by rhythm rather than by counting:
+
+| Situation | Pattern |
+|---|---|
+| **microSD missing** or not responding | **slow, regular** blink (1 s on / 1 s off) |
+| **microSD unreadable** (unsupported filesystem) | **fast, regular** blink (~3 Hz) |
+| **runtime or fatal error** | **N short blinks + a 1 s pause**, N = error code |
+
+Error codes: 2 = `ERR_CARDMAN` (can't create card folders or files), 3 = `ERR_PSRAM`,
+4 = `ERR_SETTINGS`, 5 = `ERR_CIV`, 6 = `ERR_MC_DATA`, 7 = `ERR_MC_AUTH_UNK` (PS2 only).
+With a latched error, **activity still shows through**: between red blinks you still see the
+cyan of reads and the blue of writes, because the card may well still be usable.
+
+**The three steady colours** — magenta, green and white — are the states that must be
+recognisable *at any moment*, not just when you enter them. A blink on entry is lost if you're
+looking elsewhere, and at power-on there wouldn't be one at all. Card activity keeps blinking
+**on top of** them: on the boot card, a read shows as cyan flashes over a green background.
+
+**Priority**, highest first, because there is only one LED: blink sequence in progress → pad
+mode (magenta) → the lit phase of an error pattern (red) → write (blue) → read (cyan) →
+background colour (white in MSC, green on the boot card, otherwise off).
+
+**If a microSD goes missing**, two different situations with different outcomes:
+
+| | What happens |
+|---|---|
+| **Missing at power-on** | slow red; the firmware **retries the mount every second**. Insert it and it starts on its own with the RGB sweep — no need to unplug USB. |
+| **Removed while the console is playing** | the firmware **can't tell** (these boards have no card-detect pin): writes fail, red signals the error, saves are lost. Re-inserting does **not** recover — restart it by hand. |
+
+On PMC Zero the same scheme drives the WS2812 addressable LED, where colours are full 8-bit per
+channel rather than on/off.
+
+---
+
+## 4. BootCard: read-only, out of the card list, self-exiting
+
+`Autoboot` is **on by default**. At power-up, *if a BootCard exists*, the firmware serves the
+console the card in `BOOT/` instead of the normal one. This is the FreePSXBoot path: the console
+reads the BootCard, the exploit runs, and the payload talks to the firmware over the memory-card
+bus to switch away from the boot image — no power cycling.
+
+**The BOOT slot is not a memory card. It is a special slot, reserved for booting.** That is the
+idea behind everything in this section, and it is worth stating plainly because upstream treats
+`BOOT/` as just another folder in the rotation. Here it is not one of your cards: it is the
+launcher, it has one job, and when that job is finished it gets out of the way. It is not a place
+to keep saves and you should never end up in it by accident.
+
+Every difference below is that one decision applied consistently — half of it for safety, half of
+it simply so there is nothing to be confused about:
+
+| The slot is special, so… | …which means |
+|---|---|
+| it is **not reachable with the d-pad** | scrolling Up and Down through your cards never lands on it. You get in on purpose or not at all, so you can never wonder "why is this card empty?" |
+| it has a **dedicated colour, steady green** | at any moment you know whether the console is looking at the launcher or at a real card — and when the green goes out, the exploit has handed over |
+| it is **read-only** | the console writes to it, as it writes to any card, and those writes are discarded. The payload cannot be eaten away by use |
+| it **leaves on its own once boot is done** | the payload switches away when the game starts, and a timeout catches the case where it doesn't. You are not left sitting on the launcher |
+| it is **not created automatically** | an empty boot card boots nothing, so the firmware never invents one — a missing file falls back to a normal card instead of silently pretending |
+
+Point by point.
+
+**It is not in the browse list.** Up and Down never land on it — it's a special card with an
+exploit inside, and scrolling onto it by accident makes no sense. You get in on purpose only:
+**START** inside the combo mode (§2), `card boot` on the serial port, or `Autoboot` at power-up.
+Getting *out* with Up or Down works fine, and is the quickest way back to a normal card.
+
+**It is write-protected, on two fronts.** While the boot card is mounted the console treats it
+like any memory card and writes to it early, as soon as the BIOS probes it. Writes are dropped
+both towards the microSD **and** in the RAM copy. The RAM copy is the one the console actually
+reads from, and it is only reloaded from file when you change card: a failed boot attempt used
+to scribble over it, and since the firmware is USB-powered and **a PS1 reset does not restart
+it**, that damaged image was then served to every later boot attempt. From the console's point
+of view the write still *succeeds* — it gets its `47h` acknowledgement — it just reads back
+unchanged, which is exactly how a write-protected card behaves.
+
+Without this, **a failed exploit attempt damaged the boot image itself.** The console would write
+over it, the file was left corrupted, and from then on the exploit failed for a reason that had
+nothing to do with the reason it failed the first time. Keep a copy of your boot image on the PC
+anyway — from the PC side the file is writable like any other.
+
+**It is not created automatically.** Normal cards start at `Card1`, and each new one is created
+as you reach it with the pad, folder and image both (§6). The BootCard is deliberately **not** treated that
+way, because it is not a normal card — it has one special job, booting an exploit, and an empty
+one cannot do that job. Upstream generated an empty boot card and served it to the console,
+which achieves nothing except confusion: the console sees a blank memory card, no exploit runs,
+and there is no hint that the file you meant to put there is missing.
+
+So with `Autoboot=ON` and no `MemoryCards/PS1/BOOT/BootCard-1.mcd` on the microSD, the firmware
+**falls back to the normal card** and boots as if autoboot were off. This is also why the default
+can safely be ON: on a microSD without an exploit, nothing changes.
+
+Copy your payload image in by hand — with the USB passthrough (§1) that's a drag-and-drop. The
+firmware does create the folder, a `LEGGIMI.txt` (readme) explaining what to put in it, and the
+`BootCard.ini` with `MaxChannels=1`.
+
+**The old fallback filenames are gone**, for the same reason: fewer ways to be confused. The boot
+image must be `BOOT/BootCard-1.mcd`. The old `BOOT/BootCard.mcd`, without a channel number, is
+**no longer accepted** — it was a leftover from when the boot card had no channels, and a file
+can only have one name. If your boot card stopped being picked up after upgrading, this is why:
+rename it. Note that `BOOT/` is the one place where the file is *not* named after its folder
+(it's `BootCard-N.mcd`, not `BOOT-N.mcd`) — that exception is upstream's and has not changed.
+
+**It can exit on its own.** Normally the exit is driven by the game: when a **Game ID** arrives
+(MMCE command `0x21`), a recognised ID switches to that game's card, and an unrecognised
+non-empty one switches to the default card. The payload can also send the MMCE reset (`0x27`).
+So if you start a normal game that announces no Game ID, you **stay on the BootCard** until you
+do something. For the case where the exploit simply doesn't fire, there is now a timeout:
+
+```ini
+[PS1]
+BootCardTimeout=-1    ; never — you only leave when the payload says so (default)
+BootCardTimeout=30    ; after 30 seconds, back to the default card
+BootCardTimeout=0     ; leave immediately (no practical use)
+```
+
+The countdown restarts every time you enter the BootCard, so it applies to manual entry with
+START too. Positive values are 1 to 254 seconds.
+
+**How long the green stays on** is a separate setting, because how long boot mode *lasts* and
+how long it is *signalled* are different questions:
+
+```ini
+[PS1]
+LedBootCardTimeout=-1    ; follows BootCardTimeout (default)
+LedBootCardTimeout=0     ; no steady green
+LedBootCardTimeout=5     ; green for 5 seconds, then off
+```
+
+With `0` you still get the **two long green blinks** on entry — those come from the blink
+sequence, not from the background colour. The value is automatically capped at
+`BootCardTimeout`: signalling a mode that has already ended would make no sense.
+
+> **The steady green is also your exploit indicator.** It goes out when you move to a normal
+> card — which is what the FreePSXBoot payload does when it succeeds. **Green disappearing is
+> the signal that the exploit ran.**
+
+---
+
+## 5. New serial commands
+
+Three commands are new compared to upstream: **`status`**, **`card boot`** and
+**`start emulation`**. The serial port is 115200 8N1 (the speed is irrelevant over USB CDC) and
+carries both the firmware's debug log — including the exact error when the microSD won't mount,
+with the SdFat code and the card CID — and the command interface.
+
+```text
+help                                  show the command list
+status                                configured mode, running mode, USB state, current card
+reset dev                             restart the firmware
+reset bl                              restart into BOOTSEL
+card up | card down                   next / previous card
+card boot                             mount the BootCard  (new — START on the pad)
+set card <idx> [channel <idx>]        jump straight to a card
+channel up | channel down             next / previous channel
+set channel <idx>                     jump straight to a channel
+set game <id> [channel <idx>]         set the Game ID by hand
+set mode <ps1|ps2>
+set variant <retail|proto|conquest|arcade>    PS2 only
+start emulation                       start emulation after an eject  (new)
+```
+
+`status` is the one worth knowing about: it prints the configured mode *and* the mode actually
+running (they differ while a mode switch waits for the card to go idle), the USB state, and the
+current card kind, index and channel. Without it you cannot tell "PC mode" from "emulation
+running" over the serial port.
+
+**The serial port stays alive in every state**, including while the PC has the drive mounted.
+That is new: upstream's passthrough loop never serviced the serial port, so the board looked
+frozen. What changes between states is *which* commands are allowed to run:
+
+| State | Serial | Commands |
+|---|---|---|
+| emulation running | yes | all of them |
+| **volume mounted on the PC** (passthrough) | **yes** | only the ones that don't touch the microSD: `help`, `status`, `reset dev`, `reset bl`, plus `start emulation`, which answers by telling you what to do. Anything else replies `volume montato, smonta il volume per continuare` |
+| **ejected, cable still attached** (on hold) | yes | **all of them**, `start emulation` included |
+
+The gate exists because in passthrough the microSD belongs to the host: a command that read or
+rewrote it would be doing so behind Windows' back. So `start emulation` is not something you can
+use to grab the card away from the PC — eject the volume first, then send it.
+
+`reset bl`, or opening the port at **1200 baud** and closing it, reboots into BOOTSEL without
+opening the case.
+
+### Instrumentation commands (separate build only)
+
+There is a second set of serial commands for looking at what the PS1 bus is actually doing, and
+for changing the bus timing without recompiling. `help` lists them when they are present.
+
+**Reading what happened:**
+
+| Command | What it gives you |
+|---|---|
+| `mcstat` | the *effective* state: every knob as the firmware is really applying it, plus counters and the program counters of the three state machines. Worth reading before every test — the settings survive a PS1 reset, so the risk is always the leftovers of the previous test |
+| `mcring` | the event ring: the last bus events with a microsecond timestamp each, so you can see exactly where a transfer stopped and which side stopped it |
+| `mcwrites` | writes the console made to the boot card, and what came back on read-back — this is how the write protection was confirmed |
+| `mcget` | the same state as `mcstat` but as `key=value` lines, for scripting |
+| `mcclear` | zero the counters, histograms and event ring |
+| `mmcelog` | the MMCE commands the console sent (separate build flag again) |
+
+**Changing the timing**, none of it saved — everything goes back to the compiled defaults on
+restart:
+
+| Command | What it moves |
+|---|---|
+| `set ackdelay <us>` | when the ACK pulse starts |
+| `set ackwidth <cycles>` | how long it lasts; `0` computes the 2 µs minimum |
+| `set ackhead <cycles>` | the delay before the ACK is requested |
+| `set ackwait 0\|1` | whether to wait for the 8th clock edge before the next byte |
+| `set datpio\|rxpio\|ctrlpio <div>` | the PIO clock dividers, per state machine |
+| `set txdepth 0..8` | how far ahead the TX FIFO is filled on long reads; `0` is upstream's lock-step |
+| `set profile 0\|1\|2` | auto, force the standard profile, or force the boot profile — **on any card**, which is what lets you separate what depends on the timing from what depends on the image |
+| `set mmcenodelay`, `set delayall` | whether the ACK delay applies to MMCE commands and to non-boot profiles |
+| `set boottimeout <s>` | the BootCard inactivity timeout, overriding the settings file |
+| `set tracestop 0\|1` | freeze the event ring at the first long silence, so the interesting moment isn't overwritten by what came after |
+
+**They exist only in a separate instrumented build.** The firmware images shipped here do not
+have them, and typing those commands does nothing. They are left out on purpose: the trace buffer
+costs several KB of RAM and the knobs add branches in the timing-critical path, so a build meant
+to be used should not carry either.
+
+---
+
+## 6. Folder tree created automatically
+
+On the first boot with a blank microSD the firmware creates the minimum tree and the default
+settings — and it does so right after mounting the card, **before** deciding between USB
+passthrough and emulation. So you see all of it the first time you plug the card into a PC,
+without ever having put it in a console:
+
+```
+.sd2psx/settings.ini               default settings
+.sd2psx/LEGGIMI.txt                (readme) quick reference, next to the settings
+MemoryCards/PS1/Card1/             empty
+MemoryCards/PS1/BOOT/LEGGIMI.txt   (readme) explains what to copy here
+MemoryCards/PS1/BOOT/BootCard.ini  MaxChannels=1
+```
+
+The rest appears with use:
+
+- **`Card1-1.mcd`** is created — empty and already formatted as a PS1 memory card — the first
+  time the card actually runs in a console. It isn't pre-generated because writing 128 KB would
+  make that first PC connection slower.
+- **Other folders** (`Card2/`, Game ID folders, named folders) appear when you navigate to them
+  with the pad.
+- **`BootCard-1.mcd` does not**: the boot card is copied in by hand (§4).
+
+Naming rules, worth repeating because they're easy to get wrong: the file must be named after the
+folder that holds it plus `-<channel>` (`Card3/Card3-1.mcd`), a file with any other name is not
+seen, and channels start at 1. The boot folder is exactly `BOOT` and its files are
+`BootCard-N.mcd` — the one exception to the rule, and the **old un-numbered
+`BOOT/BootCard.mcd` is no longer accepted** (§4).
+
+### Deleting `settings.ini` is now a factory reset
+
+`.sd2psx/settings.ini` is a readable mirror of the settings, which actually live in the RP2040's
+flash. The file is written by the firmware; you edit it from the PC and the changes take effect
+at the next restart.
+
+**What changed is what happens when the file is missing.**
+
+| | Missing `settings.ini` at boot |
+|---|---|
+| **Upstream** | The file is rewritten **from what is stored in flash**. You get your own settings back, character for character. Deleting it achieves nothing. |
+| **Here** | The stored settings are **reset to the firmware's defaults first**, and *then* the file is written from those. You get a clean default file. |
+
+So on this firmware, deleting `.sd2psx/settings.ini` and restarting is the way back to factory
+settings — and it is the *only* way to pick up the new defaults of a firmware version you just
+installed. That is the practical consequence worth remembering: **upgrading the firmware does not
+give you its new defaults.** Your saved values survive the upgrade and keep winning, because the
+file is regenerated from flash, not from the code. If you want the defaults a new version ships
+with, delete the file.
+
+Concretely, the file you get back is not a copy of the one you deleted. It is this:
 
 ```ini
 [General]
-Mode=PS2
+Mode=PS1
 FlippedScreen=OFF
 [PS1]
 Autoboot=ON
 GameID=ON
 EnableControllerCombo=ON
-MaxCardIdx=0
-[PS2]
-Autoboot=ON
-GameID=ON
-CardSize=16
-Variant=RETAIL
-MaxCardIdx=0
+RememberLastCard=0
+FastMode_Enable=1
+FastMode_AckDelay=0
+MaxCardIdx=10
+MaxChannels=3
+BootCardTimeout=-1
+LedBootCardTimeout=-1
 ```
 
-Possible values are:
+(plus a `[PS2]` section that has no effect while `Mode=PS1`). Current card and channel, game id
+and display settings all go back to their initial values too — this is a full reset, not just a
+tidy-up of the text file. If you have settings you care about, copy the file somewhere before
+deleting it.
 
-| Setting       | Values                                |
-|---------------|---------------------------------------|
-| Mode          | `PS1`, `PS2`                          |
-| AutoBoot      | `OFF`, `ON`                           |
-| GameID        | `OFF`, `ON`                           |
-| CardSize      | `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128` |
-| Variant       | `RETAIL`, `PROTO`, `ARCADE`, `CONQUEST`     |
-| FlippedScreen | `ON`, `OFF`                           |
-| EnableControllerCombo | `ON`, `OFF`                   |
-| MaxCardIdx    | UINT8                                 |
+> **Leave a blank line at the end of the file.** This goes for `settings.ini` and for every
+> per-card `.ini`: the parser requires it.
 
-*Note: Make sure there is an empty line at the end of the ini file.*
+---
 
-## General: Support for Other RP2040-Based MMCE Devices
+## Which file to flash
 
-Support for different MMCE devices that share the same MCU has been added:
+Three firmware images are built, and they are **not interchangeable**: each one hard-codes a
+different pinout. Flashing the wrong one gives you a board that enumerates nothing and lights
+nothing, with no error message anywhere.
 
-- **PicoMemcard+/PicoMemcardZero:** DIY devices by dangiu (see [here](https://github.com/dangiu/PicoMemcard?tab=readme-ov-file#picomemcard-using-memory-card)) without PSRAM. Use *PMC+* or *PMCZero* firmware variant.
-- **PSXMemCard:** A commercial device by BitFunX sharing the same architecture as *PMC+*. Use *psxmemcard* firmware variant.
-- **PSXMemCard Gen2:** A commercial device by BitFunX, sharing the same architecture as *sd2psx*. Use *sd2psx* firmware variant.
+| File | Board | Build variant |
+|---|---|---|
+| `psxmemcardmsc.uf2` | the custom RP2040 board this fork was written for | `PSXMemCardMSC` |
+| `pmc+.uf2` | PicoMemcard+ | `PMC+` |
+| `pmczero.uf2` | PicoMemcard on an RP2040-Zero | `PMCZero` |
+| `sd2psx.uf2` | SD2PSX / PSxMemCard Gen2 | `SD2PSX` |
 
-For each device, follow the flashing instructions provided by the creator, using the corresponding *sd2psXtd* firmware file.
+All four contain everything described on this page. What differs is the pinout and what the
+board physically has on it.
 
-*New in 1.2*:
-PMC+ and PMCZero now support using the onboard buttons. They are assigned in the following way (according to the markings ons their board):
+To flash: enter BOOTSEL, mount the `RPI-RP2` volume, copy the `.uf2` onto it.
 
-- **Button 1**: Load BootCard
-- **Button 2**:
-    - Short Press: Previous Channel
-    - Long Press: Previous Card
-- **Button 3**:
-    - Short Press: Next Channel
-    - Long Press: Next Card
+### Pinout of each build
 
-## General: Per Card Config
+Every GPIO number below is compiled into the binary. This is the table to check against your
+board before flashing anything.
 
-There are some configuration values that can be modified on a per card base within a config file named  `CardX.ini` in a card folder, where `X` is the card index.
+| Signal | `psxmemcardmsc.uf2` | `pmc+.uf2` | `pmczero.uf2` | `sd2psx.uf2` |
+|---|---|---|---|---|
+| PSX DAT | **5** | 5 | 9 | 20 |
+| PSX CMD | **6** | 6 | 10 | 19 |
+| PSX SEL | **7** | 7 | 11 | 17 |
+| PSX CLK | **8** | 8 | 12 | 18 |
+| PSX ACK | **9** | 9 | 13 | 16 |
+| SD MISO | **16** | 16 | 0 | 24 |
+| SD CS | **17** | 17 | 1 | 29 |
+| SD SCK | **18** | 18 | 2 | 26 |
+| SD MOSI | **19** | 19 | 3 | 27 |
+| SPI peripheral | **spi0** | spi0 | spi0 | spi1 |
+| LED | **RGB on 25 / 24 / 23** | none | WS2812 on 16 | none (it has the OLED) |
+| User buttons | **none** (BOOTSEL only) | 26 / 27 / 28 | 26 / 27 / 28 | 21 / 23 |
+| UART TX / RX | **0 / 1** | 0 / 1 | 7 / 8 | 8 / 9 |
+| UART baud | **115200** | 115200 | 115200 | 3000000 |
+| Display | none | none | none | SSD1306 OLED |
+| PSRAM | no | no | no | yes |
+| Flash | **2 MB** | 2 MB | 2 MB | 16 MB |
 
-*Note 1: The `CardSize` setting is only used for PS2 cards and can only be either of `1`, `2`, `4`, `8`, `16`, `32`, `64`.*
-*Note 2: The BOOT folder should contain a file named `BootCard.ini`*
-*Note 3: Make sure there is an empty line at the end of the ini file.*
+The custom board has no schematic, so its pinout was recovered by reverse-engineering the dumped
+original firmware. It turned out to match PicoMemcard's `PICO` board profile exactly, RGB LED on
+25/24/23 included. The only difference from a PicoMemcard+ is that it has **no user buttons**.
 
-```ini
-[ChannelName]
-1=Channel 1 Name
-2=Channel 2 Name
-3=Channel 3 Name
-4=Channel 4 Name
-5=Channel 5 Name
-6=Channel 6 Name
-7=Channel 7 Name
-8=Channel 8 Name
-[Settings]
-MaxChannels=8
-CardSize=8
-```
+On the boards that do have them (`pmc+.uf2`, `pmczero.uf2`) a short press changes channel and a
+long press changes card, with the third button switching to the BootCard.
 
+That is also the only reason `pmc+.uf2` exists as a separate build: the PSX and microSD pins are
+identical, so `psxmemcardmsc.uf2` runs on a PicoMemcard+ — it just looks for the buttons on the
+wrong pins, so they do nothing.
 
-## General: Game2Folder mapping
+`pmczero.uf2` matches PicoMemcard's `RP2040ZERO` profile exactly, and `pmc+.uf2`, `pmczero.uf2`
+and `sd2psx.uf2` all use upstream sd2psXtd's own pin assignments unchanged.
 
-There are some games, that share save data for multiple game ids (like the Singstar series etc). For these cases, a custom game to folder mapping can be created.
+> Two upstream variants are deliberately **not** built. `PSXMemCard` has exactly the same pins
+> as `PSXMemCardMSC`, so that board is already covered — flash `psxmemcardmsc.uf2` and you get
+> everything. `SD2PSXlite` has a stray `PARENT_DIRECTORY` inside `add_compile_definitions()` in
+> upstream's own file, and copying that verbatim would be a mistake.
 
-If a game with a mapped id is loaded, instead of using the game id based folder, the mapped folder is used for storing the card.
+> **A wrong pinout fails silently.** The firmware compiles, flashes and runs; the board simply
+> does nothing recognisable — no USB, LED and microSD driven on pins that aren't connected to
+> them, and not one error message anywhere. If a freshly flashed board shows no red-green-blue
+> sweep at power-up, suspect the file before you suspect the hardware.
 
-The mapping needs to be defined in ```.sd2psx/Game2Folder.ini``` in the following way:
+> **The first boot after upgrading resets your saved settings once** (current card and channel,
+> game id, display). This is sd2psXtd's own mechanism — the settings *version magic* was raised,
+> so the new defaults take effect and `/.sd2psx/settings.ini` is rewritten with them.
+>
+> That one-off reset only happens when the settings *layout* changes. If a later version merely
+> changes a default value, your saved settings keep winning: to pick the new defaults up, delete
+> `/.sd2psx/settings.ini` and restart. On this firmware that is a genuine factory reset —
+> [see §6](#deleting-settingsini-is-now-a-factory-reset) — whereas upstream would simply write
+> your old values back into the file.
 
-```ini
-[PS1]
-SCXS-12345=FolderName1
-[PS2]
-SCXS-23456=FolderName2
-```
+---
 
-*Note: Be aware: Long folder names may not be displayed correctly and may result in stuttering of MMCE games due to scrolling.*
-*Note 2: Make sure there is an empty line at the end of the ini file.*
+## What has actually been tested
 
-## General: Splash Screen (1.3)
-
-By default, sd2psXtd comes with a special splash screen resembling the project's logo.
-
-You can customize this by going to the splashgen page on the project website!
-
-From there, you can customize a splash screen to your needs. Once you are happy with the result displayed in the preview, press the **Download UF2** button. This will generate a UF2 file containing your splash screen.
-
-You can flash this splash screen just like any other firmware update.
-
-Alternatively, place a generated `splash.bin` in the root of the SD card. On startup, the firmware imports it into flash and removes `splash.bin` from the SD card.
-
-The flashed splash screen is maintained after a firmware update, so you probably only need to upload it once.
-
-*Note: When combining the splash screen with a firmware UF2 (such as for mass production or flashing multiple sd2psXtd with the same splash and firmware combination), it's strongly recommended to flash the combined image with `picotool`, since uploading using the usual firmware update procedure often does not work. To do so, please install `picotool` and run:*
-
-```sh
-picotool load <combined_file_name>.uf2
-```
-
-*while having the sd2psx to be updated connected in bootloader mode.*
-
-## General: Game Image Screen (1.3)
-
-Add a splash image that the device shows in the card main view. Use the splashgen page on the project website to convert a source image to the device `.bin` format, then place the generated file in the card folder on your SD card.
-
-Naming and behavior:
-
-- Folder-level splash (default for the folder):
-    - Path: `MemoryCards/<Variant>/<card_folder>/<card_folder>.bin`
-    - Example: `MemoryCards/<Variant>/SuperGame/SuperGame.bin` — used when no channel-specific image exists.
-- Channel-specific splash (overrides folder-level for that channel):
-    - Path: `MemoryCards/<Variant>/<card_folder>/<card_folder>-<channel_number>.bin`
-    - Example: `MemoryCards/<Variant>/SuperGame/SuperGame-1.bin` — shown only for channel 1 of that card folder.
-- Fallback rules:
-    - If a channel-specific file exists it is used.
-    - Otherwise the folder-level `<card_folder>.bin` is used.
-    - If neither exists, no splash is shown.
-
-Practical notes
-- `<channel_number>` matches the on-device channel index (1..N).
-- Filenames must match exactly; FAT SD cards are usually case-insensitive but keep names consistent.
-- Use `misc/splashgen/splashgen.html` to produce correctly-sized and packed `.bin` files for the OLED.
-- Keep names short — very long filenames may cause display or performance issues.
-- Store splash `.bin` files alongside that card's `CardX.ini` and save data in the same folder.
-
-
-## Special Thanks to...
-
-- **@xyz**: for sd2psx ❤️
-- **sd2psXtd Team**: (you know who you are 😉 )
-- **@El_isra**: for so much different stuff ❤️
-- **@Berion**: Our new beautiful logo ❤️
-- **8BitMods Team**: for helping out with card formatting and providing lots of other useful information ❤️
-- **@Mena / PhenomMods**: for providing hardware to some team members ❤️
-- **BitFunX**: for providing PSXMemcard and PSXMemcard Gen2 Hardware for dev ❤️
-- **All Testers**: ripto, Vapor, seewood, john3d, rippenbiest, ... ❤️
-- **@niemasd**: For his [*GameDB-PSX*](https://github.com/niemasd/GameDB-PSX) database - Game naming and ID on PS1 would not be possible without it! ❤️
+- **The custom board (`psxmemcardmsc.uf2`)**: verified on hardware — the three LED channels, the
+  boot card path, and FreePSXBoot "superfast" starting. The pad shortcut, MSC mode, the wait for
+  `start emulation` and the LED states are verified by reading the code, not on a bench.
+- **`pmc+.uf2`, `pmczero.uf2` and `sd2psx.uf2`**: they **compile, and that is all**. None of
+  those three boards was available to test on. Their pin assignments are upstream sd2psXtd's own,
+  taken unchanged and cross-checked against both the 1.4.0 release and the current upstream tree,
+  and the values that ended up in each binary were read back out of the build afterwards — but
+  nobody has watched any of those boards boot. Treat them as a starting point, keep a backup of
+  whatever firmware you're replacing, and know how to get back into BOOTSEL before you flash.

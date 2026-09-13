@@ -29,30 +29,332 @@
     in pins 1                ; sample 1 bit from the CMD line
 .wrap
 
+; --- Un solo dat_writer, e /ACK su una state machine sua ---------------------
+;
+; Prima ce n'erano due, uno per profilo, e generavano l'impulso di /ACK da se'.
+; Erano 23 istruzioni su 32 e soprattutto avevano un difetto comune: mentre la SM
+; tiene basso /ACK non e' sul "wait" del clock, e la console riparte sul FRONTE DI
+; DISCESA di /ACK, non sul rilascio - waitCardIRQ() del payload aspetta il latch
+; I_STAT.7 e ritorna, e lo stesso fa _CardExchng di PSn00bSDK. Quindi la console
+; puo' ricominciare a clockare mentre noi stiamo ancora pilotando /ACK: si perde
+; il primo fronte di discesa e il byte va fuori passo.
+;
+; Quanto ci mettevamo ad andare in ascolto, misurato in cicli dopo l'asserzione:
+;   profilo di boot   larghezza + 1   -> 1,2 us a 8 cicli, 2,13 a 15
+;   profilo standard  11              -> 4,4 us a divisore 96
+; Il boot si e' rotto per primo perche' superfast reagisce in ~1,8 us; lo standard
+; regge solo perche' il driver del BIOS e' molto piu' lento.
+;
+; Qui l'impulso lo fa ack_pulser: dat_writer lo chiede con "irq set 4" e va DRITTO
+; al wait. Due cicli, 0,27 us a divisore 32: la console non puo' essere piu'
+; veloce, quindi il primo fronte non si perde a nessuna larghezza. I due segnali
+; sono indipendenti per costruzione, non per taratura.
+;
+; Il profilo resta, ma adesso e' solo il divisore (96 o 32) piu' i parametri
+; dell'impulso: non e' piu' un programma diverso.
+;
+; Niente side-set qui: il campo di ritardo torna a 5 bit invece di 3.
 .program dat_writer
-.side_set 1 opt pindirs
     set pindirs, 0           ; release DAT line (set pin as input = Hi-Z)
     wait 0 gpio PIN_PSX_SEL  ; wait for SEL
 .wrap_target
-    pull block          [3]   ; pull a byte to send, blocking
-ack:
-     nop side 1 [4]
-    set x, 7  side 0 [5]
+PUBLIC ack_head:
+    pull block               ; pull a byte to send, blocking
+    ; Ritardo di testa, come CICLO invece che come campo di ritardo: il campo di
+    ; un'istruzione PIO e' di 5 bit e da solo arriva a 4,13 us a divisore 32,
+    ; mentre ne servono ~14. Le due parole sono riscritte a runtime da
+    ; dat_writer_set_ack_head(). Vedi il commento su quella funzione.
+    set y, 0                 ; conteggio, riscritto a runtime
+head_wait:
+    jmp y-- head_wait        ; ritardo riscritto a runtime
+    irq set 4                ; chiedi l'impulso di /ACK e prosegui
+    wait 0 gpio PIN_PSX_CLK  ; gia' in ascolto: primo fronte di discesa
+    out pindirs 1            ; presenta bit0
+    set x, 6                 ; ne restano 7
 sendbit:
     wait 1 gpio PIN_PSX_CLK  ; wait for clock to rise
     wait 0 gpio PIN_PSX_CLK  ; wait for falling clock edge
     out pindirs 1            ; output 1 bit (by changing pin direction)
     jmp x-- sendbit
-    nop [7]
-    jmp !osre ack
+
+    ; L'ottava salita: il byte e' finito davvero, e solo allora si torna al pull.
+    ; Senza, con la TX FIFO gia' piena il pull riesce subito dopo l'ottava DISCESA
+    ; e l'ACK partirebbe prima della fine del byte - fuori da quanto psx-spx
+    ; descrive, che ancora entrambi i suoi vincoli all'ULTIMO SCK.
+    ;
+    ; La coda "nop [7]" + "jmp !osre ack" del vecchio standard non serve piu':
+    ; con autopull attivo, a OSR pieno il "pull block" e' un no-op, quindi i byte
+    ; consecutivi ripartono comunque senza rifare il pull.
+PUBLIC ack_wait:
+    wait 1 gpio PIN_PSX_CLK
+.wrap
+
+
+; --- L'impulso di /ACK, su una state machine sua ----------------------------
+;
+; Tiene basso /ACK per una durata controllata senza mai bloccare il percorso dei
+; dati. Durata = (1 + d0) + (N + 1) * (1 + d1) cicli, con d0 e d1 nei campi di
+; ritardo (0..7) e N nell'immediato del "set": da 2 a 264 cicli, cioe' da 0,27 a
+; 35 us a divisore 32. Il tetto sta sotto il timeout di 100 us della console,
+; quindi lo stesso knob serve anche alla prova sui fronti: impulso lungo, e si
+; guarda se i byte arrivano durante o solo dopo.
+;
+; Le tre parole si riscrivono a runtime: sono un "set" e un "jmp" all'indietro
+; che punta a se' stesso, quindi non c'e' niente da rilocare.
+.program ack_pulser
+.side_set 1 opt pindirs
+.wrap_target
+    wait 1 irq 4             ; richiesta da dat_writer; il wait cancella il flag
+PUBLIC ack_lo:
+    set x, 6   side 1        ; /ACK basso; i 4 parametri riscritti a runtime
+outer:
+    set y, 6
+inner:
+    jmp y-- inner
+    jmp x-- outer
+    nop        side 0        ; rilascio
 .wrap
 
 
 % c-sdk {
+#include "hardware/clocks.h"
 
 #define PS1_CLKDIV 96
+/* Divisore del profilo boot: 240 MHz / 32 = 7,5 MHz di clock PIO, contro i
+   2,5 MHz dello standard.
+ *
+ * Il PIO presenta il bit sul DAT dopo il fronte di discesa con 3 cicli di
+ * ritardo: 2 di sincronizzatore d'ingresso piu' l'istruzione "out". A 500 kHz,
+ * la velocita' che il payload superfast usa nella fase dati, fra la discesa e
+ * la salita su cui la console campiona c'e' 1 us:
+ *
+ *   divisore 96 -> 1,2 us di ritardo, margine negativo, dati corrotti
+ *   divisore 50 -> 0,63 us, non basta col tempo di salita del DAT (open drain)
+ *   divisore 32 -> 0,4 us, margine 0,6 us: misurato funzionante
+ *
+ * A 250 kHz, cioe' in tutto l'uso normale, la finestra e' 2 us e il divisore 96
+ * ha gia' margine abbondante: per questo il valore rapido vale solo sulla boot
+ * card, dove non costa il filtraggio dei disturbi che il divisore alto offre. */
+#define PS1_CLKDIV_BOOT 32
 
-static inline void cmd_reader_program_init(PIO pio, uint sm, uint offset) {
+/* --- Larghezza dell'impulso di ACK ----------------------------------------
+ *
+ * psx-spx: "The device has to pull /ACK low for at least 2 us to request the
+ * host to transfer another byte."
+ *
+ * L'impulso si conta in CICLI PIO, quindi la sua durata dipende dal divisore:
+ * scrivere un numero di cicli fisso significa cambiare la durata ogni volta che
+ * si cambia il divisore, ed e' esattamente come si e' finiti fuori specifica
+ * (a divisore 32 gli 8 cicli di prima valevano 1,07 us, meta' del minimo).
+ * Il numero di cicli va quindi CALCOLATO dal divisore e dal clock di sistema.
+ *
+ * La verifica della formula e' il programma standard di upstream: a 240 MHz e
+ * divisore 96 il PIO gira a 2,5 MHz, dove 2 us sono 5 cicli - ed e' esattamente
+ * quello che "nop side 1 [4]" fa da sempre. Non era un numero a caso, era la
+ * specifica; applicare la formula li' e' un no-op dimostrabile. */
+#define PS1_ACK_MIN_US 2u
+
+/* La larghezza che la release 77336ba aveva scritta nel programma, e l'unica
+   validata sull'hardware: 8 cicli, cioe' 1066 ns a divisore 32 - sotto il
+   minimo di specifica, e funzionante. I 15 cicli che servirebbero per stare
+   nei 2 us a quel divisore NON avviano l'exploit (misurato). Resta il default
+   finche' non c'e' una misura che dica il contrario. */
+#define PS1_ACK_CYCLES_RELEASE 8u
+
+/* Ritardo prima di consegnare il byte al PIO, e quindi prima dell'ACK.
+ *
+ * ATTENZIONE a cosa fa e cosa non fa: ritarda l'ACK solo quando il PIO sta
+ * aspettando core1 sul "pull block", cioe' a TX FIFO vuota. Se la FIFO ha gia'
+ * il byte successivo l'ACK esce comunque all'istante, e questo qui non lo
+ * tocca: allora frena soltanto core1 quanto basta a tenere la FIFO vuota. E'
+ * un mascheramento, e la posizione dell'ACK la corregge la "wait 1 gpio" in
+ * coda a dat_writer. Vedi docs/ISSUE-59.md. */
+#define PS1_ACK_DELAY_BOOT_US   24u
+
+/* Cicli per l'impulso: 2 fissi (le due istruzioni) piu' i due campi di ritardo
+   da 3 bit, quindi 2..16 nel programma di boot e 1..8 nello standard, dove
+   l'impulso e' una sola istruzione. */
+/* Limiti dell'impulso generato da ack_pulser: vedi ps1_ack_pulse_solve(). */
+/* Ritardo di testa fra il "pull" e la richiesta dell'impulso, in cicli PIO.
+ *
+ * Sposta SOLO l'istante dell'ACK: quando parte, core1 ha gia' consegnato il
+ * byte ed e' libero. E' la differenza con ack_delay_us, che invece ferma core1
+ * in un ciclo di attesa in C, e la prova P2 del 04/09 ha mostrato che a contare
+ * e' la POSIZIONE dell'ACK, non la lentezza del software: con un ritardo che da
+ * solo falliva (13 us) sono bastati 4,13 us aggiunti qui perche' l'exploit
+ * partisse. Il pavimento sta fra 13,1 e 14,1 us di offset TOTALE, e i due
+ * contributi si sommano.
+ *
+ * Prima era il campo di ritardo di una sola istruzione, cinque bit, quindi al
+ * massimo 31 cicli = 4,13 us a divisore 32. Ne servono ~105, quindi ora e' un
+ * ciclo di conteggio come quello di ack_pulser.
+ *
+ * Durata = 1 + (M + 1) * (1 + d) cicli, con M nell'immediato del "set" (0..31)
+ * e d nel campo di ritardo del "jmp" (0..31, cinque bit perche' dat_writer non
+ * ha side-set): da 2 a 1025 cicli, cioe' da 0,27 a 136 us a divisore 32.
+ *
+ * Il minimo e' 2 e non 0 perche' le due istruzioni si eseguono comunque: 0,27
+ * us a divisore 32, sotto la risoluzione di qualunque cosa misuriamo. Per
+ * questo PS1_ACK_HEAD_STD passa da 1 a 2 - stessa durata in pratica. */
+#define PS1_ACK_HEAD_STD    2u
+#define PS1_ACK_HEAD_BOOT   0u
+#define PS1_ACK_HEAD_MAX  254u   /* 255 e' il sentinella "segui il profilo" */
+
+static inline uint ps1_ack_head_solve(uint want, uint *pM, uint *pd) {
+    uint best = 2u, bM = 0u, bd = 0u;   /* le due istruzioni da sole */
+
+    if (want < 2u) want = 2u;
+    for (uint d = 0; d < 32u; d++) {
+        for (uint M = 0; M < 32u; M++) {
+            const uint tot = 1u + (M + 1u) * (1u + d);
+            if ((tot <= want) && (tot > best)) {
+                best = tot; bM = M; bd = d;
+            }
+        }
+    }
+    *pM = bM; *pd = bd;
+    return best;
+}
+
+/* Ritorna i cicli effettivamente programmati: possono essere meno di quelli
+   chiesti se il valore non e' rappresentabile dalla coppia (M, d). */
+static inline uint dat_writer_set_ack_head(PIO pio, uint offset, uint cycles) {
+    uint M, d;
+    if (cycles > PS1_ACK_HEAD_MAX) cycles = PS1_ACK_HEAD_MAX;
+    const uint got = ps1_ack_head_solve(cycles, &M, &d);
+    const uint base = offset + dat_writer_offset_ack_head;
+
+    pio->instr_mem[base + 0] = pio_encode_pull(false, true);
+    pio->instr_mem[base + 1] = pio_encode_set(pio_y, M);
+    pio->instr_mem[base + 2] = pio_encode_jmp_y_dec(base + 2u)
+                             | pio_encode_delay(d);
+    return got;
+}
+
+/* Il ciclo annidato costa 4 cicli nella configurazione minima, e questo e' il
+   prezzo di poter arrivare lontano: la larghezza piu' fine passa da 2 a 4
+   cicli, cioe' da 267 a 533 ns a divisore 32. Nessuna misura si appoggia a
+   quella risoluzione - il pavimento che conta e' il minimo di specifica, 2 us -
+   mentre il tetto serve, e serve alto: vedi il commento su ps1_ack_pulse_solve.
+   */
+#define PS1_ACK_CYCLES_MIN      4u
+#define PS1_ACK_CYCLES_MAX   8264u
+
+/* Cicli PIO necessari a PS1_ACK_MIN_US al divisore dato, arrotondati per
+   eccesso. A 240 MHz: divisore 96 -> 5 cicli, divisore 32 -> 15. */
+static inline uint ps1_ack_cycles_for_div(uint clkdiv) {
+    const uint64_t num = (uint64_t)PS1_ACK_MIN_US * (uint64_t)clock_get_hz(clk_sys);
+    const uint64_t den = (uint64_t)clkdiv * 1000000u;
+    const uint64_t cyc = (num + den - 1u) / den;   /* ceil */
+    return (cyc < 1u) ? 1u : (uint)cyc;
+}
+
+/* --- Durata dell'impulso di ack_pulser -------------------------------------
+ *
+ *   durata = (1 + d0) + (N + 1) * (2 + (M + 1) * (1 + d1))     cicli PIO
+ *
+ * dove d0 e d1 sono i campi di ritardo dei due "set"/"jmp" (0..7), N e M i due
+ * immediati (0..31). Da 4 a 8264 cicli: a divisore 32 sono 0,53 us fino a
+ * 1,1 ms, a divisore 96 da 1,6 us a 3,3 ms.
+ *
+ * PERCHE' un ciclo annidato, che costa due istruzioni in piu'. Il ciclo singolo
+ * arrivava a 264 cicli, cioe' 35 us a divisore 32. Non bastano: la prova che
+ * stabilisce su quale fronte la console riparte funziona tenendo /ACK basso a
+ * lungo e guardando se i byte arrivano DURANTE l'impulso, e con un impulso di
+ * 20-35 us un driver che reagisse in 40 us verrebbe letto come "aspetta il
+ * rilascio" quando invece e' soltanto lento. Un impulso di 75 us lascia fuori
+ * solo i driver piu' lenti del timeout di specifica, e quindi la lettura
+ * diventa una misura invece di un indizio.
+ *
+ * Si cerca la combinazione piu' vicina dal basso, e a parita' quella col ciclo
+ * interno piu' corto, che rende la durata piu' fine. */
+static inline uint ps1_ack_pulse_solve(uint want, uint *pd0, uint *pN,
+                                       uint *pM, uint *pd1) {
+    uint best = 0, bd0 = 0, bN = 0, bM = 0, bd1 = 0;
+
+    if (want < PS1_ACK_CYCLES_MIN) want = PS1_ACK_CYCLES_MIN;
+    if (want > PS1_ACK_CYCLES_MAX) want = PS1_ACK_CYCLES_MAX;
+
+    /* 8 x 32 x 8 = 2048 combinazioni: il blocco interno si calcola una volta
+       per (d1, M), e per ogni d0 il numero di giri esterni e' una divisione. */
+    for (uint d1 = 0; d1 < 8u; d1++) {
+        for (uint m = 0; m < 32u; m++) {
+            const uint blk = 2u + (m + 1u) * (1u + d1);
+            for (uint d0 = 0; d0 < 8u; d0++) {
+                const uint head = 1u + d0;
+                if (head + blk > want)
+                    break;
+                uint n1 = (want - head) / blk;      /* giri esterni */
+                if (n1 > 32u) n1 = 32u;
+                const uint tot = head + n1 * blk;
+                if ((tot <= want) && (tot > best)) {
+                    best = tot; bd0 = d0; bN = n1 - 1u; bM = m; bd1 = d1;
+                }
+            }
+        }
+        if (best == want)
+            break;                                   /* esatto: basta */
+    }
+    *pd0 = bd0; *pN = bN; *pM = bM; *pd1 = bd1;
+    return best;
+}
+
+/* Riscrive le cinque parole dell'impulso. instr_mem e' di SOLA SCRITTURA,
+   quindi vanno ricostruite invece che modificate. I due "jmp" sono ASSOLUTI e
+   quindi vanno rilocati sull'offset in cui il programma e' stato caricato: e'
+   la ragione per cui questa funzione prende l'offset e non lo deduce.
+   La scrittura di una parola a 32 bit e' atomica: non serve fermare la SM.
+
+   Ritorna i cicli effettivamente programmati, che possono essere meno di quelli
+   chiesti se il valore non e' rappresentabile: il chiamante lo confronta. */
+static inline uint ack_pulser_set_cycles(PIO pio, uint offset, uint cycles) {
+    uint d0, n, m, d1;
+    const uint got  = ps1_ack_pulse_solve(cycles, &d0, &n, &m, &d1);
+    const uint base = offset + ack_pulser_offset_ack_lo;
+
+    /* set x, N  side 1 [d0]   -> /ACK basso e carica i giri esterni */
+    pio->instr_mem[base + 0] = pio_encode_set(pio_x, n)
+                             | pio_encode_sideset_opt(1, 1)
+                             | pio_encode_delay(d0);
+    /* outer:  set y, M        -> giri interni */
+    pio->instr_mem[base + 1] = pio_encode_set(pio_y, m);
+    /* inner:  jmp y-- inner [d1] */
+    pio->instr_mem[base + 2] = pio_encode_jmp_y_dec(base + 2u)
+                             | pio_encode_delay(d1);
+    /*         jmp x-- outer */
+    pio->instr_mem[base + 3] = pio_encode_jmp_x_dec(base + 1u);
+    /* nop side 0 -> rilascio. Riscritta anche lei, per non dipendere da cosa
+       avesse lasciato pio_add_program(). */
+    pio->instr_mem[base + 4] = pio_encode_nop() | pio_encode_sideset_opt(1, 0);
+    return got;
+}
+
+static inline void ack_pulser_program_init(PIO pio, uint sm, uint offset, uint clkdiv) {
+    pio_sm_config c = ack_pulser_program_get_default_config(offset);
+
+    sm_config_set_sideset_pins(&c, PIN_PSX_ACK);
+
+    /* /ACK e' open drain: il valore del pin resta 0 e si pilota la DIREZIONE.
+       Nel profilo di boot solo questa SM lo mappa, cosi' non se lo contende con
+       dat_writer. */
+    pio_sm_set_pins_with_mask(pio, sm, 0x00000000, 1 << PIN_PSX_ACK);
+    pio_sm_set_consecutive_pindirs(pio, sm, PIN_PSX_ACK, 1, false);
+    pio_gpio_init(pio, PIN_PSX_ACK);
+
+    sm_config_set_clkdiv_int_frac(&c, clkdiv, 0x00);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+/* Accende o spegne l'attesa dell'ottava salita descritta sopra ack_wait.
+   Spenta diventa un nop. Con l'impulso su una SM sua questa non ha piu'
+   contro-effetti sulla prontezza: dice soltanto se l'ACK possa precedere la
+   fine del byte quando la TX FIFO e' gia' piena. */
+static inline void dat_writer_set_ack_wait(PIO pio, uint offset, bool enabled) {
+    pio->instr_mem[offset + dat_writer_offset_ack_wait] =
+        enabled ? pio_encode_wait_gpio(true, PIN_PSX_CLK) : pio_encode_nop();
+}
+
+static inline void cmd_reader_program_init(PIO pio, uint sm, uint offset, uint clkdiv) {
     pio_sm_config c = cmd_reader_program_get_default_config(offset);
 
     sm_config_set_in_pins(&c, PIN_PSX_CMD);
@@ -64,12 +366,12 @@ static inline void cmd_reader_program_init(PIO pio, uint sm, uint offset) {
     sm_config_set_in_shift(&c, true, true, 8);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 
-    sm_config_set_clkdiv_int_frac(&c, PS1_CLKDIV, 0x00);
+    sm_config_set_clkdiv_int_frac(&c, clkdiv, 0x00);
 
     pio_sm_init(pio, sm, offset, &c);
 }
 
-static inline void controller_program_init(PIO pio, uint sm, uint offset) {
+static inline void controller_program_init(PIO pio, uint sm, uint offset, uint clkdiv) {
     pio_sm_config c = cmd_reader_program_get_default_config(offset);
 
     sm_config_set_in_pins(&c, PIN_PSX_DAT);
@@ -81,22 +383,20 @@ static inline void controller_program_init(PIO pio, uint sm, uint offset) {
     sm_config_set_in_shift(&c, true, true, 8);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 
-    sm_config_set_clkdiv_int_frac(&c, PS1_CLKDIV, 0x00);
+    sm_config_set_clkdiv_int_frac(&c, clkdiv, 0x00);
 
     pio_sm_init(pio, sm, offset, &c);
 }
 
-static inline void dat_writer_program_init(PIO pio, uint sm, uint offset) {
+/* Corpo comune ai due dat_writer: cambia solo il programma da cui viene la
+   configurazione di partenza. */
+/* Il pin /ACK non e' piu' suo: lo pilota ack_pulser, sempre. Qui resta solo il
+   DAT. */
+static inline void dat_writer_program_init(PIO pio, uint sm, uint offset, uint clkdiv) {
     pio_sm_config c = dat_writer_program_get_default_config(offset);
 
     sm_config_set_out_pins(&c, PIN_PSX_DAT, 1);
     sm_config_set_set_pins(&c, PIN_PSX_DAT, 1);
-    sm_config_set_sideset_pins(&c, PIN_PSX_ACK);
-
-    /* configure ACK pin for open drain */
-    pio_sm_set_pins_with_mask(pio, sm, 0x00000000, 1 << PIN_PSX_ACK);
-    pio_sm_set_consecutive_pindirs(pio, sm, PIN_PSX_ACK, 1, false);
-    pio_gpio_init(pio, PIN_PSX_ACK);
 
     /* configure DAT pin for open drain */
     pio_sm_set_pins_with_mask(pio, sm, 0x00000000, 1 << PIN_PSX_DAT);
@@ -111,9 +411,11 @@ static inline void dat_writer_program_init(PIO pio, uint sm, uint offset) {
     sm_config_set_out_shift(&c, true, true, 8);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 
-    sm_config_set_clkdiv_int_frac(&c, PS1_CLKDIV, 0x00);
+    sm_config_set_clkdiv_int_frac(&c, clkdiv, 0x00);
 
     pio_sm_init(pio, sm, offset, &c);
 }
+
+
 
 %}
